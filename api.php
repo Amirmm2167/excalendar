@@ -105,8 +105,15 @@ function readData($file) {
     }
     // Ensure root is an array for users and issues
     elseif ((basename($file) === 'users.json' || basename($file) === 'issues.json') && !is_array($data)) {
-        error_log("Invalid structure in $file: expected root array.");
-        $data = []; // Reset to empty array if structure is wrong 
+        error_log("Invalid structure in $file: expected root array, found object. Attempting to recover.");
+        // Attempt to recover by filtering for numeric keys, in case of corruption like {"0": {}, "1": {}}
+        $recoveredData = [];
+        foreach ($data as $key => $value) {
+            if (is_numeric($key) && is_array($value)) {
+                $recoveredData[] = $value;
+            }
+        }
+        $data = $recoveredData;
     }
 
 

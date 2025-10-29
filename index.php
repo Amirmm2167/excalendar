@@ -105,9 +105,10 @@ $tehran_offset = date('P'); // e.g., +03:30
     
 
     
-    <div id="event-modal" class="modal-overlay"> <div class="modal-content">
+    <div id="event-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="event-modal-title" style="display: none;">
+        <div class="modal-content">
             <h3 id="event-modal-title">ثبت رویداد جدید</h3>
-            <form id="event-form" novalidate> 
+            <form id="event-form" novalidate>
                 <input type="hidden" id="eventId">
 
                 <div class="form-row">
@@ -181,9 +182,9 @@ $tehran_offset = date('P'); // e.g., +03:30
     </div>
 
     
-    <div id="settings-modal" class="modal-overlay">
+    <div id="settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" style="display: none;">
         <div class="modal-content">
-            <h3>تنظیمات اصلی تقویم</h3>
+            <h3 id="settings-modal-title">تنظیمات اصلی تقویم</h3>
             <div class="form-group">
                 <label for="mainHeader">عنوان اصلی تقویم</label>
                 <input type="text" id="mainHeader"> </div>
@@ -198,9 +199,9 @@ $tehran_offset = date('P'); // e.g., +03:30
     </div>
 
     
-    <div id="depts-modal" class="modal-overlay">
+    <div id="depts-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="depts-modal-title" style="display: none;">
         <div class="modal-content">
-            <h3>مدیریت دپارتمان‌ها</h3>
+            <h3 id="depts-modal-title">مدیریت دپارتمان‌ها</h3>
             <div id="depts-list-editor">
                 </div> <button type="button" id="add-new-dept-btn" class="action-btn secondary add-item-btn"> + افزودن دپارتمان جدید</button>
             <div class="modal-actions single-row">
@@ -210,8 +211,9 @@ $tehran_offset = date('P'); // e.g., +03:30
          </div> </div>
 
     
-    <div id="users-modal" class="modal-overlay">
-        <div class="modal-content large"> <h3>مدیریت کاربران</h3>
+    <div id="users-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="users-modal-title" style="display: none;">
+        <div class="modal-content large">
+            <h3 id="users-modal-title">مدیریت کاربران</h3>
             <div id="users-list-editor">
                 </div>
              <button type="button" id="add-new-user-btn" class="action-btn secondary add-item-btn">+ افزودن کاربر جدید</button> <div class="modal-actions single-row">
@@ -221,9 +223,9 @@ $tehran_offset = date('P'); // e.g., +03:30
     </div>
 
     
-    <div id="issue-modal" class="modal-overlay">
+    <div id="issue-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="issue-modal-title" style="display: none;">
         <div class="modal-content">
-             <h3>گزارش مشکل / بازخورد</h3> <form id="issue-form">
+             <h3 id="issue-modal-title">گزارش مشکل / بازخورد</h3> <form id="issue-form">
                 <div class="form-group">
                     <label for="issue-text">لطفا مشکل یا بازخورد خود را بنویسید:</label>
                     <textarea id="issue-text" rows="5" required></textarea> </div>
@@ -235,8 +237,9 @@ $tehran_offset = date('P'); // e.g., +03:30
     </div>
 
     
-    <div id="view-issues-modal" class="modal-overlay">
-         <div class="modal-content"> <h3>مشاهده پیام‌های دریافتی</h3>
+    <div id="view-issues-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="view-issues-modal-title" style="display: none;">
+         <div class="modal-content">
+            <h3 id="view-issues-modal-title">مشاهده پیام‌های دریافتی</h3>
             <div id="issues-list-container">
                 </div>
             <div class="modal-actions single-row"> <button type="button" id="close-issues-btn" class="action-btn secondary">بستن</button>

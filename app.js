@@ -1263,21 +1263,24 @@ document.addEventListener('DOMContentLoaded', () => {
             elements.isAllDayCheckbox.checked = event.isAllDay || false; // 
 
             try {
-                // Populate Date and Time Inputs
-                const startDT = new Date(event.startDateTime); // 
-                let endDT = new Date(event.endDateTime); // 
-                let isEndTime24 = event.endDateTime.includes('T24:00'); // 
-                if (isEndTime24) endDT.setTime(endDT.getTime() - 1); // Adjust for date input value
+                // Populate Date and Time Inputs directly from ISO string to avoid timezone conversion
+                if (event.startDateTime && event.startDateTime.includes('T')) {
+                    const [startDate, startTime] = event.startDateTime.split('T');
+                    elements.startDateInput.value = startDate;
+                    elements.startTimeInput.value = startTime.substring(0, 5); // HH:MM
+                } else { throw new Error("Invalid startDateTime format"); }
 
-                if (!isNaN(startDT)) {
-                    elements.startDateInput.value = formatDate(startDT); // YYYY-MM-DD
-                    elements.startTimeInput.value = `${String(startDT.getHours()).padStart(2,'0')}:${String(startDT.getMinutes()).padStart(2,'0')}`; // 
-                } else throw new Error("Invalid start date"); // 
+                if (event.endDateTime && event.endDateTime.includes('T')) {
+                    const [endDate, endTime] = event.endDateTime.split('T');
+                    elements.endDateInput.value = endDate;
+                    // Handle the special "24:00:00" case
+                    if (endTime.startsWith('24:00')) {
+                        elements.endTimeInput.value = '24:00';
+                    } else {
+                        elements.endTimeInput.value = endTime.substring(0, 5); // HH:MM
+                    }
+                } else { throw new Error("Invalid endDateTime format"); }
 
-                if (!isNaN(endDT)) {
-                    elements.endDateInput.value = formatDate(endDT); // YYYY-MM-DD (adjusted if 24:00)
-                    elements.endTimeInput.value = isEndTime24 ? '24:00' : `${String(new Date(event.endDateTime).getHours()).padStart(2,'0')}:${String(new Date(event.endDateTime).getMinutes()).padStart(2,'0')}`; // Use original for time if not 24:00
-                } else throw new Error("Invalid end date"); // 
                 // Colors for manager
                 if (CURRENT_USER.role === ROLES.MANAGER) {
                      elements.managerColorInputs.style.display = 'block'; // 
@@ -1939,14 +1942,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!elements.fabMenu || !elements.fabMainBtn) return;
         elements.fabMenu.innerHTML = ''; // Clear previous
 
-        // Add document click handler for closing FAB menu
-        document.addEventListener('click', (e) => {
-            if (!elements.fabContainer.contains(e.target) && elements.fabMainBtn.classList.contains('active')) {
-                elements.fabMainBtn.classList.remove('active');
-                elements.fabMenu.classList.remove('active');
-            }
-        });
-
         const role = CURRENT_USER.role;
         let actions = [];
 
@@ -1966,14 +1961,6 @@ document.addEventListener('DOMContentLoaded', () => {
         } else { // viewer
             actions = [reportIssueAction].filter(Boolean);
         }
-
-        // Setup main FAB button click handler
-        elements.fabMainBtn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            elements.fabMainBtn.classList.toggle('active');
-            elements.fabMenu.classList.toggle('active');
-        });
 
         // Create buttons
         actions.forEach((action, index) => {
@@ -2413,6 +2400,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // 13. EVENT LISTENERS SETUP
     // ===================================================================
     function setupEventListeners() {
+        // --- Close modals on Escape key ---
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const activeModal = document.querySelector('.modal-overlay.active');
+                if (activeModal) {
+                    switch (activeModal.id) {
+                        case 'event-modal': closeEventModal(); break;
+                        case 'settings-modal': closeSettingsModal(); break;
+                        case 'depts-modal': closeDeptsModal(); break;
+                        case 'users-modal': closeUsersModal(); break;
+                        case 'issue-modal': closeIssueModal(); break;
+                        case 'view-issues-modal': closeViewIssuesModal(); break;
+                    }
+                }
+            }
+        });
+
         // --- FAB Button ---
         elements.fabMainBtn?.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -2516,20 +2520,11 @@ document.addEventListener('DOMContentLoaded', () => {
              }
          });
         // --- FAB Menu ---
-        if (elements.fabMainBtn) {
-            elements.fabMainBtn.addEventListener('click', (e) => {
-                 e.stopPropagation(); // 
-                 elements.fabMainBtn.classList.toggle('active'); // 
-                 elements.fabMenu?.classList.toggle('active'); // 
-            });
-            // Close FAB on outside click (added robustness)
-            document.addEventListener('click', (e) => {
-                if (elements.fabContainer && !elements.fabContainer.contains(e.target) && elements.fabMainBtn.classList.contains('active')) {
-                    elements.fabMainBtn.classList.remove('active'); // 
-                    elements.fabMenu?.classList.remove('active'); // 
-                }
-            });
-        }
+        elements.fabMainBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            elements.fabMainBtn.classList.toggle('active');
+            elements.fabMenu?.classList.toggle('active');
+        });
 
         // --- Event Modal ---
         if (elements.eventModal) {
