@@ -260,7 +260,7 @@ button, .button, a.button { border: none; background: none; font-family: inherit
     position: fixed; 
     bottom: 1.5rem; 
     right: 1.5rem;  /* Changed to right side */ 
-    z-index: 1001;
+    z-index: 900;
     display: flex; 
     align-items: flex-end;
     pointer-events: none;
@@ -344,6 +344,10 @@ button, .button, a.button { border: none; background: none; font-family: inherit
                 transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
                 visibility 0s linear 0s;
     filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15));
+}.fab-main.active + .fab-menu {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    pointer-events: auto;
 }
 
 .fab-action { 
