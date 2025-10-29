@@ -1,0 +1,3893 @@
+api.php
+
+<?php
+session_start();
+header('Content-Type: application/json; charset=utf-8');
+date_default_timezone_set('Asia/Tehran'); // (*** اصلاح‌شده ***) تنظیم منطقه زمانی سرور
+
+// مسیر فایل‌های داده
+define('DATA_FILE', './data/data.json');
+define('USERS_FILE', './data/users.json');
+define('ISSUES_FILE', './data/issues.json');
+
+// --- بررسی احراز هویت ---
+if (!isset($_SESSION['user_id'])) {
+    http_response_code(401);
+    echo json_encode(['success' => false, 'message' => 'Unauthorized']);
+    exit;
+}
+
+// --- اطلاعات کاربر فعلی از سشن ---
+$CURRENT_USER_ID = $_SESSION['user_id'];
+$CURRENT_USER_ROLE = $_SESSION['role'];
+$CURRENT_USER_DEPT_ID = $_SESSION['departmentId'];
+$CURRENT_USER_PERMS = $_SESSION['permissions'];
+
+// --- توابع کمکی خواندن/نوشتن ---
+function readData($file) {
+    if (!file_exists($file)) return null;
+    $content = file_get_contents($file);
+    if ($content === false) return null;
+    $data = json_decode($content, true);
+    // اطمینان از اینکه events همیشه یک آرایه است
+    if (isset($data['events']) && !is_array($data['events'])) {
+        $data['events'] = [];
+    }
+     if (!isset($data['events'])) { // اگر اصلا وجود نداشت
+        $data['events'] = [];
+    }
+     // اطمینان برای بقیه آرایه‌ها
+     if (isset($data['departments']) && !is_array($data['departments'])) { $data['departments'] = []; }
+     if (isset($data['holidays']) && !is_array($data['holidays'])) { $data['holidays'] = []; }
+    return $data;
+}
+function writeData($file, $data) {
+    // اطمینان از اینکه events همیشه یک آرایه است
+    if (isset($data['events']) && !is_array($data['events'])) {
+        $data['events'] = [];
+    }
+     // مرتب‌سازی رویدادها بر اساس تاریخ شروع قبل از ذخیره
+    if (isset($data['events']) && is_array($data['events'])) {
+        usort($data['events'], function($a, $b) {
+            $startA = $a['startDateTime'] ?? '9999-12-31T23:59:59'; // تاریخ خیلی دور برای موارد نامعتبر
+            $startB = $b['startDateTime'] ?? '9999-12-31T23:59:59';
+            // اعتبار سنجی ساده فرمت قبل از مقایسه
+            $regex = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/';
+            // (*** اصلاح‌شده ***) Regex برای پذیرش آفست زمانی
+            $regexWithOffset = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/';
+            
+            if (!preg_match($regex, $startA) && !preg_match($regexWithOffset, $startA)) $startA = '9999-12-31T23:59:59';
+            if (!preg_match($regex, $startB) && !preg_match($regexWithOffset, $startB)) $startB = '9999-12-31T23:59:59';
+
+            // مقایسه مستقیم رشته‌های ISO کار می‌کند
+            return strcmp($startA, $startB);
+        });
+    }
+    return file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+
+// --- مدیریت اکشن‌ها ---
+$action = $_GET['action'] ?? '';
+$input = json_decode(file_get_contents('php://input'), true);
+
+try {
+    // خواندن داده‌ها با تابع اصلاح شده
+    $appData = readData(DATA_FILE);
+    $usersData = readData(USERS_FILE);
+    $issuesData = readData(ISSUES_FILE);
+
+    if ($appData === null || $usersData === null || $issuesData === null) {
+        throw new Exception('خطای بحرانی: یک یا چند فایل داده (data.json, users.json, issues.json) یافت نشدند یا قابل خواندن نیستند.');
+    }
+
+
+    switch ($action) {
+
+        case 'getData':
+            // $data از $appData خوانده می‌شود
+            $data = $appData;
+            $all_users = $usersData; // از $usersData
+
+            $weekStartDateStr = $_GET['weekStartDate'] ?? $data['settings']['weekStartDate'];
+            // اعتبار سنجی فرمت تاریخ ورودی
+             if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $weekStartDateStr)) {
+                 // (*** اصلاح‌شده ***) استفاده از تاریخ امروز تهران
+                 $weekStartDateStr = date('Y-m-d'); // چون timezone در بالا ست شده، این تاریخ تهران است
+             }
+            
+            // (*** اصلاح‌شده ***) اطمینان از اینکه DateTime بر اساس تهران ساخته می‌شود
+            $weekStartDT = new DateTime($weekStartDateStr, new DateTimeZone('Asia/Tehran'));
+            $weekStartDT->setTime(0, 0, 0);
+            $weekEndDT = clone $weekStartDT;
+            $weekEndDT->modify('+7 days');
+
+            $dateFilteredEvents = [];
+            // $data['events'] تضمین شده که آرایه است
+            foreach ($data['events'] as $event) {
+                // پرش از رویدادهای بدون تاریخ یا با فرمت نامعتبر
+                // (*** اصلاح‌شده ***) Regex برای پذیرش آفست زمانی
+                $dateTimeRegex = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2})?$/';
+                $endDateTimeRegex = '/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}(:\d{2})?|24:00(:00)?)?([+-]\d{2}:\d{2})?$/';
+                
+                if (empty($event['startDateTime']) || empty($event['endDateTime']) ||
+                    !preg_match($dateTimeRegex, $event['startDateTime']) ||
+                    !preg_match($endDateTimeRegex, $event['endDateTime']) // اجازه 24:00 برای پایان
+                   ) {
+                       continue;
+                   }
+
+                 try {
+                     // مدیریت حالت خاص 24:00
+                     $endStr = $event['endDateTime'];
+                     // حذف آفست زمانی برای بررسی 24:00
+                     $endStrForCheck = preg_replace('/[+-]\d{2}:\d{2}$/', '', $endStr);
+                     
+                     $isEndTime24 = str_ends_with($endStrForCheck, 'T24:00') || str_ends_with($endStrForCheck, 'T24:00:00');
+                     
+                     if ($isEndTime24) {
+                         // تاریخ را استخراج کن (T را پیدا کن)
+                         $datePart = substr($endStr, 0, strpos($endStr, 'T'));
+                         // آفست را استخراج کن (اگر وجود داشت)
+                         preg_match('/([+-]\d{2}:\d{2})$/', $endStr, $matches);
+                         $offset = $matches[0] ?? '';
+                         
+                         $endStr = $datePart . 'T23:59:59' . $offset; // تبدیل موقت برای ساخت DateTime
+                     }
+
+                    // (*** اصلاح‌شده ***) ساخت DateTime با در نظر گرفتن آفست موجود در رشته
+                    $eventStartDT = new DateTime($event['startDateTime']);
+                    $eventEndDT = new DateTime($endStr);
+                     
+                     if ($isEndTime24) {
+                         $eventEndDT->modify('+1 second'); // برگرداندن به نیمه‌شب روز بعد
+                     }
+
+                    if ($eventStartDT < $weekEndDT && $eventEndDT > $weekStartDT) {
+                        $dateFilteredEvents[] = $event;
+                    }
+                 } catch (Exception $e) {
+                     // لاگ کردن خطا یا نادیده گرفتن رویداد نامعتبر
+                     error_log("Invalid DateTime format for event ID " . ($event['id'] ?? 'N/A') . ": " . $e->getMessage());
+                     continue;
+                 }
+            }
+
+            // فیلتر دسترسی ... (بدون تغییر)
+             $filteredEvents = [];
+            if ($CURRENT_USER_ROLE === 'manager' || $CURRENT_USER_ROLE === 'evaluator') {
+                foreach ($dateFilteredEvents as $event) {
+                    if (($event['status'] ?? '') === 'approved' || ($event['status'] ?? '') === 'pending') {
+                        $filteredEvents[] = $event;
+                    }
+                }
+            } else {
+                 $view_all_depts = $CURRENT_USER_PERMS['view_all_depts'] ?? false;
+                 $view_depts = $CURRENT_USER_PERMS['view_depts'] ?? [];
+                 $view_all_users = $CURRENT_USER_PERMS['view_all_users'] ?? false;
+                 $view_users = $CURRENT_USER_PERMS['view_users'] ?? [];
+                 foreach ($dateFilteredEvents as $event) {
+                    $proposerId = $event['proposerId'] ?? null;
+                    $deptId = $event['departmentId'] ?? null;
+                    $status = $event['status'] ?? '';
+
+                    $isOwnEvent = $proposerId === $CURRENT_USER_ID;
+                     if ($isOwnEvent) {
+                         $filteredEvents[] = $event;
+                         continue;
+                     }
+                     if ($status !== 'approved') {
+                         continue;
+                     }
+                     $hasDeptAccess = $view_all_depts || ($deptId && in_array($deptId, $view_depts));
+                     $hasUserAccess = $view_all_users || ($proposerId && in_array($proposerId, $view_users));
+                     if ($hasDeptAccess || $hasUserAccess) {
+                         $filteredEvents[] = $event;
+                     }
+                 }
+            }
+
+
+            $data['events'] = $filteredEvents; // فقط رویدادهای فیلتر شده را برگردان
+            $data['users'] = array_map(function($user) {
+                unset($user['password_hash']);
+                return $user;
+            }, $all_users); // $all_users از $usersData خوانده شده
+
+            // فقط settings, events, users, holidays, departments را برگردان
+             $outputData = [
+                 'settings' => $data['settings'] ?? [],
+                 'events' => $data['events'] ?? [],
+                 'holidays' => $data['holidays'] ?? [],
+                 'departments' => $data['departments'] ?? [],
+                 'users' => $data['users'] ?? []
+             ];
+
+            echo json_encode(['success' => true, 'data' => $outputData]);
+            break;
+
+        case 'saveSettings':
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $data = $appData; // استفاده از داده خوانده شده در ابتدا
+            if (isset($input['headerText'])) { $data['settings']['headerText'] = filter_var($input['headerText'], FILTER_SANITIZE_STRING); }
+            if (isset($input['weekStartDate']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $input['weekStartDate'])) {
+                 $data['settings']['weekStartDate'] = $input['weekStartDate'];
+            }
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'تنظیمات ذخیره شد']);
+            break;
+
+        case 'saveEvent':
+            if ($CURRENT_USER_ROLE === 'viewer') throw new Exception('Access Denied');
+            $data = $appData; // استفاده از داده خوانده شده در ابتدا
+            $eventData = $input['event'];
+            $isEditing = !empty($eventData['id']);
+
+            // (*** اصلاح‌شده ***) Regex برای پذیرش آفست زمانی
+            $dateTimeRegex = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2})?$/';
+            $endDateTimeRegex = '/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2}|24:00:00)([+-]\d{2}:\d{2})?$/';
+            
+            // اعتبار سنجی DateTime
+            if (empty($eventData['startDateTime']) || empty($eventData['endDateTime']) ||
+                !preg_match($dateTimeRegex, $eventData['startDateTime']) ||
+                !preg_match($endDateTimeRegex, $eventData['endDateTime'])
+               ) {
+                 throw new Exception("فرمت تاریخ یا ساعت شروع/پایان نامعتبر است.");
+            }
+
+            try {
+                // (*** اصلاح‌شده ***) ساخت DateTime با در نظر گرفتن آفست موجود در رشته
+                $startDT = new DateTime($eventData['startDateTime']);
+                
+                // مدیریت حالت 24:00 برای پایان
+                $endStr = $eventData['endDateTime'];
+                $endStrForCheck = preg_replace('/[+-]\d{2}:\d{2}$/', '', $endStr);
+                $isEndTime24 = str_ends_with($endStrForCheck, 'T24:00:00');
+
+                if ($isEndTime24) {
+                     $datePart = substr($endStr, 0, strpos($endStr, 'T'));
+                     preg_match('/([+-]\d{2}:\d{2})$/', $endStr, $matches);
+                     $offset = $matches[0] ?? '';
+                     
+                     // برای ساخت DateTime، آن را به 00:00 روز بعد تبدیل می‌کنیم
+                     $tempDate = new DateTime($datePart . 'T00:00:00' . $offset);
+                     $tempDate->modify('+1 day');
+                     $compareEndDT = $tempDate;
+                } else {
+                    $compareEndDT = new DateTime($eventData['endDateTime']);
+                }
+
+                if ($compareEndDT <= $startDT) {
+                    throw new Exception("تاریخ و ساعت پایان باید بعد از تاریخ و ساعت شروع باشد.");
+                }
+            } catch (Exception $e) {
+                throw new Exception("خطا در پردازش تاریخ و ساعت: " . $e->getMessage());
+            }
+
+
+            if ($isEditing) {
+                $eventIndex = false;
+                 // پیدا کردن ایندکس بر اساس ID (مطمئن شویم عددی است یا رشته)
+                 foreach ($data['events'] as $index => $e) {
+                     if (isset($e['id']) && (string)$e['id'] === (string)$eventData['id']) {
+                         $eventIndex = $index;
+                         break;
+                     }
+                 }
+
+                if ($eventIndex === false) throw new Exception('رویداد یافت نشد');
+                $existingEvent = $data['events'][$eventIndex];
+
+                // (*** اصلاح‌شده ***) منطق ویرایش
+                $canEdit = $CURRENT_USER_ROLE === 'manager' ||
+                           $CURRENT_USER_ROLE === 'evaluator' || // ارزیاب هم می‌تواند ویرایش کند
+                           ($existingEvent['proposerId'] === $CURRENT_USER_ID && ($existingEvent['status'] === 'pending' || $existingEvent['status'] === 'rejected')); // پیشنهاددهنده فقط قبل از تایید یا رد شده
+                if (!$canEdit) throw new Exception('شما اجازه ویرایش این رویداد را ندارید');
+
+                // فیلدهایی که نباید توسط کاربر عادی تغییر کنند
+                 $allowedToChange = ['title', 'by', 'for', 'goal', 'isAllDay', 'startDateTime', 'endDateTime'];
+                 if ($CURRENT_USER_ROLE === 'manager') {
+                     $allowedToChange = array_merge($allowedToChange, ['color', 'textColor', 'status', 'departmentId']); // مدیر همه چیز را می‌تواند تغییر دهد
+                 } elseif ($CURRENT_USER_ROLE === 'evaluator') {
+                      $allowedToChange = array_merge($allowedToChange, ['status']); // ارزیاب وضعیت را می‌تواند تغییر دهد
+                 }
+
+                $updatedEvent = $existingEvent; // شروع با داده‌های موجود
+                 foreach($eventData as $key => $value) {
+                     if (in_array($key, $allowedToChange)) {
+                         // اعتبار سنجی یا پاکسازی ورودی‌ها
+                         if ($key === 'isAllDay') $value = (bool)$value;
+                         elseif ($key === 'goal') $value = filter_var($value, FILTER_SANITIZE_STRING, FILTER_FLAG_NO_ENCODE_QUOTES);
+                         // (*** اصلاح‌شده ***) اجازه دادن به کاراکترهای خاص در تاریخ
+                         elseif ($key === 'startDateTime' || $key === 'endDateTime') $value = filter_var($value, FILTER_SANITIZE_STRING, FILTER_FLAG_NO_ENCODE_QUOTES);
+                         else $value = filter_var($value, FILTER_SANITIZE_STRING);
+                         $updatedEvent[$key] = $value;
+                     }
+                 }
+
+
+                 // منطق وضعیت (اگر کاربر مجاز به تغییر بود و وضعیت جدیدی ارسال شده بود)
+                 if (in_array('status', $allowedToChange) && isset($eventData['status'])) {
+                      $updatedEvent['status'] = $eventData['status'];
+                 }
+                 // اگر proposer در حال ویرایش پیشنهاد رد شده است، وضعیت رد شده باقی بماند
+                 elseif ($CURRENT_USER_ROLE === 'proposer' && $existingEvent['status'] === 'rejected') {
+                      $updatedEvent['status'] = 'rejected';
+                 }
+                  // اگر وضعیت جدیدی ارسال نشده بود، وضعیت قبلی حفظ شود
+                 else {
+                      $updatedEvent['status'] = $existingEvent['status'];
+                 }
+
+
+                $data['events'][$eventIndex] = $updatedEvent;
+                $message = 'رویداد با موفقیت ویرایش شد';
+
+            } else {
+                // افزودن رویداد جدید
+                $dept = null;
+                if ($CURRENT_USER_DEPT_ID) {
+                    $dept = array_values(array_filter($data['departments'] ?? [], fn($d) => ($d['id'] ?? null) === $CURRENT_USER_DEPT_ID))[0] ?? null;
+                }
+
+                $newEvent = [
+                    'id' => time() . rand(100, 999),
+                    'proposerId' => $CURRENT_USER_ID,
+                    'departmentId' => $CURRENT_USER_DEPT_ID,
+                    'title' => filter_var($eventData['title'] ?? '', FILTER_SANITIZE_STRING),
+                    'by' => filter_var($eventData['by'] ?? '', FILTER_SANITIZE_STRING),
+                    'for' => filter_var($eventData['for'] ?? '', FILTER_SANITIZE_STRING),
+                    'goal' => filter_var($eventData['goal'] ?? '', FILTER_SANITIZE_STRING, FILTER_FLAG_NO_ENCODE_QUOTES),
+                    'isAllDay' => (bool)($eventData['isAllDay'] ?? false),
+                    'startDateTime' => $eventData['startDateTime'], // قبلا اعتبار سنجی شده
+                    'endDateTime' => $eventData['endDateTime'], // قبلا اعتبار سنجی شده
+                ];
+
+
+                if ($CURRENT_USER_ROLE === 'manager' || $CURRENT_USER_ROLE === 'evaluator') {
+                    $newEvent['status'] = 'approved';
+                    $message = 'رویداد با موفقیت افزوده شد';
+                     // رنگ برای مدیر/ارزیاب
+                     $newEvent['color'] = filter_var($eventData['color'] ?? ($dept['color'] ?? '#5c6bc0'), FILTER_SANITIZE_STRING);
+                     $newEvent['textColor'] = filter_var($eventData['textColor'] ?? '#ffffff', FILTER_SANITIZE_STRING);
+                } else { // Proposer
+                    $newEvent['status'] = 'pending';
+                    $message = 'پیشنهاد شما ثبت شد و در انتظار تایید است';
+                     // رنگ برای پیشنهاد دهنده
+                     $newEvent['color'] = $dept['color'] ?? '#c8c8c8'; // رنگ دپارتمان یا خاکستری
+                     $newEvent['textColor'] = '#ffffff';
+                }
+
+                $data['events'][] = $newEvent;
+            }
+
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => $message]);
+            break;
+
+        case 'updateEventStatus':
+            if ($CURRENT_USER_ROLE !== 'manager' && $CURRENT_USER_ROLE !== 'evaluator') throw new Exception('Access Denied');
+            $data = $appData;
+            $eventId = filter_var($input['id'] ?? null, FILTER_SANITIZE_STRING);
+            $newStatus = filter_var($input['status'] ?? null, FILTER_SANITIZE_STRING);
+            if (!$eventId || !$newStatus || !in_array($newStatus, ['approved', 'rejected', 'pending'])) {
+                 throw new Exception('ID رویداد یا وضعیت نامعتبر است.');
+            }
+
+            $eventIndex = false;
+            foreach ($data['events'] as $index => $e) { if (isset($e['id']) && (string)$e['id'] === (string)$eventId) { $eventIndex = $index; break; } }
+            if ($eventIndex === false) throw new Exception('Event not found');
+
+            $data['events'][$eventIndex]['status'] = $newStatus;
+            // اگر تایید شد، رنگ دپارتمان پیشنهاد دهنده را اعمال کن
+            if ($newStatus === 'approved') {
+                 $proposerDeptId = $data['events'][$eventIndex]['departmentId'] ?? null;
+                 $dept = null;
+                 if ($proposerDeptId) {
+                      $dept = array_values(array_filter($data['departments'] ?? [], fn($d) => ($d['id'] ?? null) === $proposerDeptId))[0] ?? null;
+                 }
+                  // اگر رویداد از قبل رنگ داشت (مثلا توسط مدیر ست شده بود)، آن را تغییر نده
+                 if (!isset($data['events'][$eventIndex]['color'])) {
+                     $data['events'][$eventIndex]['color'] = $dept['color'] ?? '#5c6bc0'; // رنگ دپارتمان یا پیش‌فرض
+                 }
+                 if (!isset($data['events'][$eventIndex]['textColor'])) {
+                     $data['events'][$eventIndex]['textColor'] = '#ffffff';
+                 }
+            }
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'وضعیت رویداد به‌روز شد']);
+            break;
+
+        case 'deleteEvent':
+            $data = $appData;
+             $eventId = filter_var($input['id'] ?? null, FILTER_SANITIZE_STRING);
+             if (!$eventId) throw new Exception('ID رویداد نامعتبر است.');
+
+            $eventIndex = false;
+            foreach ($data['events'] as $index => $e) { if (isset($e['id']) && (string)$e['id'] === (string)$eventId) { $eventIndex = $index; break; } }
+            if ($eventIndex === false) throw new Exception('Event not found');
+
+            $existingEvent = $data['events'][$eventIndex];
+            $canDelete = $CURRENT_USER_ROLE === 'manager' ||
+                         $CURRENT_USER_ROLE === 'evaluator' ||
+                         (($existingEvent['proposerId'] ?? null) === $CURRENT_USER_ID && ($existingEvent['status'] ?? '') !== 'approved');
+            if (!$canDelete) throw new Exception('Access Denied');
+
+            array_splice($data['events'], $eventIndex, 1);
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'رویداد حذف شد']);
+            break;
+
+        case 'manageDepartments':
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $data = $appData;
+            // اعتبار سنجی و پاکسازی دپارتمان‌های ورودی
+             $cleanDepartments = [];
+             if (isset($input['departments']) && is_array($input['departments'])) {
+                 foreach ($input['departments'] as $dept) {
+                     if (!empty($dept['name']) && !empty($dept['color'])) {
+                         $cleanDepartments[] = [
+                             'id' => filter_var($dept['id'] ?? ('d_'.time().rand(100,999)), FILTER_SANITIZE_STRING),
+                             'name' => filter_var($dept['name'], FILTER_SANITIZE_STRING),
+                             'color' => filter_var($dept['color'], FILTER_SANITIZE_STRING) // یا اعتبار سنجی هگزادسیمال
+                         ];
+                     }
+                 }
+             }
+            $data['departments'] = $cleanDepartments;
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'دپارتمان‌ها به‌روزرسانی شدند']);
+            break;
+
+        case 'manageUsers':
+            // ... (بخش مدیریت کاربران بدون تغییر باقی می‌ماند) ...
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $users = $usersData; // استفاده از داده خوانده شده در ابتدا
+            $sub_action = $input['sub_action'] ?? '';
+            $clientUser = $input['user'] ?? null;
+            switch ($sub_action) {
+                case 'delete':
+                    $userIdToDelete = filter_var($clientUser['id'] ?? null, FILTER_SANITIZE_STRING);
+                    if (!$userIdToDelete) throw new Exception('User ID required');
+                    if ($userIdToDelete === $CURRENT_USER_ID) throw new Exception('شما نمی‌توانید حساب کاربری خود را حذف کنید.');
+                    $users = array_filter($users, fn($u) => ($u['id'] ?? null) !== $userIdToDelete);
+                    $message = 'کاربر با موفقیت حذف شد';
+                    break;
+                case 'save':
+                     // اعتبار سنجی و پاکسازی ورودی کاربر
+                     $cleanUser = [];
+                     $cleanUser['id'] = filter_var($clientUser['id'] ?? null, FILTER_SANITIZE_STRING);
+                     $cleanUser['username'] = filter_var($clientUser['username'] ?? '', FILTER_SANITIZE_STRING);
+                     $cleanUser['displayName'] = filter_var($clientUser['displayName'] ?? '', FILTER_SANITIZE_STRING);
+                     $cleanUser['password'] = $clientUser['password'] ?? null; // رمز عبور پاکسازی نمی‌شود
+                     $cleanUser['role'] = filter_var($clientUser['role'] ?? 'viewer', FILTER_SANITIZE_STRING);
+                     $cleanUser['departmentId'] = filter_var($clientUser['departmentId'] ?? null, FILTER_SANITIZE_STRING);
+                      // پاکسازی permissions
+                     $perms = $clientUser['permissions'] ?? [];
+                     $cleanUser['permissions'] = [
+                         'view_all_depts' => !empty($perms['view_all_depts']),
+                         'view_depts' => array_map(fn($id) => filter_var($id, FILTER_SANITIZE_STRING), $perms['view_depts'] ?? []),
+                         'view_all_users' => !empty($perms['view_all_users']),
+                         'view_users' => array_map(fn($id) => filter_var($id, FILTER_SANITIZE_STRING), $perms['view_users'] ?? [])
+                     ];
+
+
+                    if (empty($cleanUser['username'])) throw new Exception('نام کاربری الزامی است');
+                    if (empty($cleanUser['displayName'])) throw new Exception('نام نمایشی الزامی است');
+                    $isEditing = !empty($cleanUser['id']);
+                    if ($isEditing) {
+                         $userIndex = false;
+                         foreach ($users as $index => $u) { if (($u['id'] ?? null) === $cleanUser['id']) { $userIndex = $index; break; } }
+                        if ($userIndex === false) throw new Exception('User not found');
+
+                         // فقط فیلدهای مشخص شده را آپدیت کن
+                         $users[$userIndex]['username'] = $cleanUser['username'];
+                         $users[$userIndex]['displayName'] = $cleanUser['displayName'];
+                         $users[$userIndex]['role'] = $cleanUser['role'];
+                         $users[$userIndex]['departmentId'] = $cleanUser['departmentId'];
+                         $users[$userIndex]['permissions'] = $cleanUser['permissions'];
+                        if (!empty($cleanUser['password'])) {
+                            $users[$userIndex]['password_hash'] = password_hash($cleanUser['password'], PASSWORD_DEFAULT);
+                        }
+                        $message = 'کاربر با موفقیت ویرایش شد';
+                    } else {
+                        if (empty($cleanUser['password'])) throw new Exception('رمز عبور برای کاربر جدید الزامی است');
+                        $newUser = $cleanUser; // استفاده از داده پاکسازی شده
+                        $newUser['id'] = 'u_' . time() . rand(100,999);
+                        $newUser['password_hash'] = password_hash($newUser['password'], PASSWORD_DEFAULT);
+                        unset($newUser['password']);
+                        $users[] = $newUser;
+                        $message = 'کاربر با موفقیت افزوده شد';
+                    }
+                    break;
+                default:
+                    throw new Exception('Invalid sub-action for manageUsers');
+            }
+            writeData(USERS_FILE, array_values($users));
+            $updatedUsers = array_map(function($user) {
+                unset($user['password_hash']);
+                return $user;
+            }, readData(USERS_FILE)); // خواندن مجدد از فایل برای اطمینان
+            echo json_encode(['success' => true, 'message' => $message, 'data' => $updatedUsers]);
+            break;
+
+        case 'reportIssue':
+            $issues = $issuesData; // استفاده از داده خوانده شده در ابتدا
+             $issueText = filter_var($input['text'] ?? '', FILTER_SANITIZE_STRING, FILTER_FLAG_NO_ENCODE_QUOTES);
+             if (empty($issueText)) throw new Exception("متن پیام نمی‌تواند خالی باشد.");
+            $newIssue = [
+                'id' => time(),
+                'userId' => $CURRENT_USER_ID,
+                'userName' => $_SESSION['displayName'], // از سشن خوانده شود
+                'text' => $issueText,
+                'timestamp' => date('c'), // فرمت ISO 8601 (با آفست تهران)
+                'status' => 'new'
+            ];
+            $issues[] = $newIssue;
+            writeData(ISSUES_FILE, $issues);
+            echo json_encode(['success' => true, 'message' => 'پیام شما با موفقیت ثبت شد.']);
+            break;
+
+        case 'getIssues':
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $issues = $issuesData; // استفاده از داده خوانده شده در ابتدا
+            // مرتب سازی با اطمینان از وجود timestamp
+            usort($issues, fn($a, $b) => ($b['timestamp'] ?? '') <=> ($a['timestamp'] ?? ''));
+            echo json_encode(['success' => true, 'data' => $issues]);
+            break;
+
+        default:
+            http_response_code(400);
+            throw new Exception('Invalid Action');
+    }
+} catch (Exception $e) {
+    http_response_code(500);
+    // نمایش trace فقط در محیط توسعه (مثلا با تنظیم متغیر محیطی)
+    $trace = (getenv('APP_ENV') === 'development') ? $e->getTraceAsString() : null;
+    error_log("API Error: " . $e->getMessage() . ($trace ? "\nTrace: " . $trace : "")); // لاگ کردن خطا در سرور
+    echo json_encode(['success' => false, 'message' => $e->getMessage(), 'trace' => $trace]);
+}
+
+?>
+
+
+app.js
+
+document.addEventListener('DOMContentLoaded', () => {
+
+    // --- State Variables ---
+    let fullData = { settings: {}, events: [], holidays: [], departments: [], users: [] };
+    const WEEK_DAYS = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'];
+    let currentView = 'grid';
+    let currentWeekStartDate = new Date();
+    let timeIndicatorInterval = null; // (*** جدید ***) برای نشانگر زمان
+    let pollingInterval = null; // (*** جدید ***) برای آپدیت خودکار
+    let lastFetchedDataString = ''; // (*** جدید ***) برای آپدیت خودکار
+
+
+    // (*** اصلاح‌شده ***) متغیرهای وضعیت جسچرهای موبایل
+    let mobileViewConfig = {
+        dayCount: 7, // 1, 2, 3, 4, 7
+        hourZoom: 2  // (*** اصلاح‌شده ***) 1=8 slots, 2=12 slots, 3=24 compressed, 4=24 large
+    };
+    let gestureState = {
+        active: false,
+        type: null, // 'horizontal' or 'vertical'
+        startX: 0,
+        startY: 0,
+        lastDist: 0,
+        isSwipe: false,
+        swipeStartX: 0,
+        swipeMinDist: 50 // حداقل فاصله برای تشخیص swipe
+    };
+
+    // --- Element Selectors ---
+    const calendarGridContainer = document.getElementById('calendar-grid-container');
+    const calendarListContainer = document.getElementById('calendar-list-container');
+    const calendarTitle = document.getElementById('calendar-title');
+    const loader = document.getElementById('loader-overlay');
+    const legendBtn = document.getElementById('color-legend-btn');
+    const legendPopup = document.getElementById('color-legend-popup');
+    const viewToggleBtn = document.getElementById('view-toggle-btn');
+    const prevWeekBtn = document.getElementById('prev-week-btn');
+    const nextWeekBtn = document.getElementById('next-week-btn');
+    // const mobileTimeIndicatorContainer = document.getElementById('mobile-time-indicator-container'); // حذف شد
+
+    // --- FAB Menu Elements ---
+    const fabContainer = document.querySelector('.fab-container'); // (*** جدید ***)
+    const fabMainBtn = document.getElementById('fab-main-btn');
+    const fabMenu = document.getElementById('fab-menu');
+
+    // --- Event Modal Elements (*** اصلاح‌شده برای استایل قبلی ***) ---
+    const eventModal = document.getElementById('event-modal');
+    const eventModalTitle = document.getElementById('event-modal-title');
+    const eventForm = document.getElementById('event-form');
+    const eventIdInput = document.getElementById('eventId');
+    const eventTitleInput = document.getElementById('eventTitle');
+    const eventByInput = document.getElementById('eventBy');
+    const eventForInput = document.getElementById('eventFor');
+    const eventGoalGroup = document.getElementById('event-goal-group');
+    const eventGoalInput = document.getElementById('eventGoal');
+    const isAllDayCheckbox = document.getElementById('isAllDay');
+    // (*** بازگشت به دراپ‌داون و ورودی متن ***)
+    const startDaySelect = document.getElementById('startDay');
+    const startTimeInput = document.getElementById('startTime');
+    const endDaySelect = document.getElementById('endDay');
+    const endTimeInput = document.getElementById('endTime');
+
+    const approvalActions = document.getElementById('approval-actions');
+    const approveEventBtn = document.getElementById('approve-event-btn');
+    const rejectEventBtn = document.getElementById('reject-event-btn');
+    const deleteEventBtn = document.getElementById('delete-event-btn');
+    const saveEventBtn = document.getElementById('save-event-btn');
+    const cancelEventBtn = document.getElementById('cancel-event-btn');
+    const managerColorInputs = document.getElementById('event-colors-manager');
+    // --- Settings Modal Elements ---
+    const settingsModal = document.getElementById('settings-modal');
+    const mainHeaderInput = document.getElementById('mainHeader');
+    const weekSelector = document.getElementById('weekSelector');
+
+    // --- Depts Modal Elements ---
+    const deptsModal = document.getElementById('depts-modal');
+    const deptsListEditor = document.getElementById('depts-list-editor');
+
+    // --- Users Modal Elements ---
+    const usersModal = document.getElementById('users-modal');
+    const usersListEditor = document.getElementById('users-list-editor');
+
+    // --- Issue Modals Elements ---
+    const issueModal = document.getElementById('issue-modal');
+    const issueTextInput = document.getElementById('issue-text');
+    const viewIssuesModal = document.getElementById('view-issues-modal');
+    const issuesListContainer = document.getElementById('issues-list-container');
+    // --- Helper Functions ---
+    const showLoader = () => loader.classList.remove('hidden');
+    const hideLoader = () => loader.classList.add('hidden');
+    const toPersian = (str) => String(str).replace(/[0-9]/g, (w) => '۰۱۲۳۴۵۶۷۸۹'[+w]);
+    const timeToMinutes = (timeStr) => {
+        if (!timeStr) return 0;
+        const parts = String(timeStr).split(':');
+        const h = parseInt(parts[0] || '0', 10);
+        const m = parseInt(parts[1] || '0', 10);
+        // مدیریت 24:00
+        if (h === 24 && m === 0) return 24 * 60;
+        return h * 60 + m;
+    };
+    const formatDate = (date) => {
+        if (!date || isNaN(date)) return '';
+        // بررسی معتبر بودن تاریخ
+        try {
+            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        } catch (e) { console.error("FormatDate Error:", e); return ''; }
+    };
+    const formatTime = (timeStr) => {
+        if (!timeStr) return "00:00";
+        const trimmedTime = String(timeStr).trim();
+        // مدیریت 24:00
+        if (trimmedTime === '24:00') return '24:00';
+        const parts = trimmedTime.split(':');
+        // اعتبار سنجی دقیق تر
+        const hVal = parseInt(parts[0], 10);
+        const mVal = parseInt(parts[1], 10);
+        if (isNaN(hVal) || isNaN(mVal) || hVal < 0 || hVal >= 24 || mVal < 0 || mVal >= 60) {
+            console.warn("Invalid time format detected:", timeStr);
+            return "00:00"; // برگرداندن مقدار پیش‌فرض در صورت خطا
+        }
+        const h = String(hVal).padStart(2, '0');
+        const m = String(mVal).padStart(2, '0');
+        return `${h}:${m}`;
+    };
+
+    // (*** بازنویسی کامل ***) ترکیب تاریخ و زمان با آفست تهران، مستقل از مرورگر
+    const combineDateTime = (dayIndex, timeString) => {
+        try {
+            const dayIdxNum = parseInt(dayIndex, 10);
+            if (isNaN(dayIdxNum) || dayIdxNum < 0 || dayIdxNum > 6) return null;
+
+            // 1. تاریخ شروع هفته را بگیر (که قبلا بر اساس تهران محاسبه شده)
+            const baseDate = new Date(currentWeekStartDate);
+
+            // 2. تاریخ هدف را با اضافه کردن روز محاسبه کن
+            baseDate.setDate(baseDate.getDate() + dayIdxNum);
+            const targetDateStr = formatDate(baseDate); // "YYYY-MM-DD"
+
+            // 3. زمان را فرمت کن
+            const time = formatTime(timeString); // "HH:MM" or "24:00"
+
+            // 4. آفست تهران را بگیر
+            const offset = TEHRAN_TIMEZONE_OFFSET || '+03:30';
+
+            // 5. رشته نهایی ISO 8601 با آفست تهران را بساز
+            if (time === "24:00") {
+                return `${targetDateStr}T24:00:00${offset}`;
+            } else {
+                return `${targetDateStr}T${time}:00${offset}`; // اضافه کردن ثانیه ":00"
+            }
+        } catch (e) {
+             console.error("combineDateTime Error:", e);
+             return null;
+        }
+    };
+
+     // (*** جدید ***) محاسبه روز هفته از تاریخ کامل
+    const getDayIndexFromDateTime = (dateTimeString) => {
+         try {
+             // ساخت آبجکت Date از رشته ISO (که ممکن است آفست داشته باشد)
+             const eventDate = new Date(dateTimeString);
+             if (isNaN(eventDate)) return 0; // مدیریت تاریخ نامعتبر
+
+             // اطمینان از اینکه شروع هفته هم ساعت 00:00 است
+             const startOfWeek = new Date(currentWeekStartDate);
+             startOfWeek.setHours(0, 0, 0, 0);
+
+             // ساخت تاریخ روز رویداد (بدون ساعت)
+             const eventDateStartOfDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
+
+             const startOfWeekMS = startOfWeek.getTime();
+             const eventDateStartOfDayMS = eventDateStartOfDay.getTime();
+
+             const diffTime = eventDateStartOfDayMS - startOfWeekMS;
+             // گرد کردن به نزدیکترین عدد صحیح برای جلوگیری از خطای محاسباتی اعشار
+             const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+             // اطمینان از اینکه نتیجه بین 0 و 6 است
+             return Math.max(0, Math.min(6, diffDays));
+         } catch (e) {
+             console.error("getDayIndexFromDateTime Error:", e, dateTimeString);
+             return 0; // مقدار پیش‌فرض در صورت خطا
+         }
+    };
+
+    // (*** جدید ***) تابع کمکی برای دریافت ساعت و روز هفته بر اساس تهران
+    function getTehranParts(dateObj) {
+         try {
+             // Get parts in Tehran timezone
+             // 'en-CA' فرمت YYYY-MM-DD و 'hc-h23' فرمت 23 ساعته (0-23) را تضمین می‌کند
+             const formatter = new Intl.DateTimeFormat('en-CA-u-hc-h23', {
+                 timeZone: 'Asia/Tehran',
+                 year: 'numeric',
+                 month: 'numeric',
+                 day: 'numeric',
+                 hour: 'numeric',
+                 minute: 'numeric',
+                 weekday: 'long'
+             });
+             const parts = formatter.formatToParts(dateObj);
+             const getValue = (type) => parts.find(p => p.type === type)?.value;
+
+             const dayName = getValue('weekday');
+             // (0=Sun, 1=Mon, ... 6=Sat)
+             const dayMap = {'Sunday': 0, 'Monday': 1, 'Tuesday': 2, 'Wednesday': 3, 'Thursday': 4, 'Friday': 5, 'Saturday': 6};
+
+             // (0=Sat, 1=Sun, ... 6=Fri)
+             const appDayIndex = (dayMap[dayName] + 1) % 7;
+
+             let hour = parseInt(getValue('hour'), 10);
+             // Intl ممکن است ساعت 24 را به عنوان 00 در روز بعد برگرداند،
+             // یا ممکن است '24' برگرداند. 'h23' باید 0-23 برگرداند.
+             // اگر ساعت 24 بود، آن را 0 در نظر می‌گیریم (چون روز عوض شده)
+             if (hour === 24) hour = 0;
+
+             return {
+                 dayIndex: appDayIndex,
+                 hour: hour,
+                 minute: parseInt(getValue('minute'), 10)
+             };
+         } catch (e) {
+             console.warn("Intl.DateTimeFormat failed, using local time for indicator.", e);
+             // Fallback به زمان محلی (که ممکن است اشتباه باشد)
+             return {
+                 dayIndex: (dateObj.getDay() + 1) % 7,
+                 hour: dateObj.getHours(),
+                 minute: dateObj.getMinutes()
+             };
+         }
+    }
+
+    // ===================================================================
+    // 2. API Call Function
+    // ===================================================================
+    async function apiCall(action, data = null, method = 'POST') {
+        let shouldShowLoader = !(action === 'getData' && pollingInterval);
+        // فقط برای polling لودر نمایش نده
+        if (shouldShowLoader) showLoader();
+        try {
+            const options = { method: method, headers: { 'Content-Type': 'application/json' }, };
+            let url = `api.php?action=${action}`;
+            if (method === 'POST') { if (data) { options.body = JSON.stringify(data);
+             } }
+            else if (method === 'GET' && data) { const params = new URLSearchParams(data);
+             url += `&${params.toString()}`; }
+
+            const response = await fetch(url, options);
+            const responseText = await response.text();
+             if (!response.ok) {
+                console.error(`HTTP error! status: ${response.status}. Response Text:`, responseText);
+                let errorMsg = `خطای HTTP ${response.status}`;
+                 try { const errorJson = JSON.parse(responseText); errorMsg = errorJson.message || errorMsg;
+                 } catch(e) {}
+                 throw new Error(errorMsg);
+             }
+             const result = JSON.parse(responseText);
+             if (!result.success) { console.error('API Error Payload:', result); throw new Error(result.message || 'خطای ناشناخته از سرور');
+             }
+            return result;
+        } catch (error) {
+            console.error('API Call Error:', error);
+            if (shouldShowLoader) { alert(`خطا در ارتباط با سرور: ${error.message}`); }
+            return null;
+        } finally {
+             if (shouldShowLoader) hideLoader();
+        }
+    }
+
+    // ===================================================================
+    // 3. MAIN RENDER LOGIC
+    // ===================================================================
+
+    // (*** اصلاح‌شده ***) این تابع به سطح بالا منتقل شد تا در دسترس باشد
+    async function fetchAndRenderCurrentWeekData() {
+         const currentWeekStartStr = formatDate(currentWeekStartDate);
+         const tempPollingStatus = pollingInterval;
+         pollingInterval = true; // جلوگیری از نمایش لودر در apiCall
+         const result = await apiCall('getData', { weekStartDate: currentWeekStartStr }, 'GET');
+         pollingInterval = tempPollingStatus; // بازگرداندن وضعیت
+         if (result && result.data) {
+             lastFetchedDataString = JSON.stringify(result.data.events || []);
+             fullData = result.data;
+             updateCalendarTitle();
+             renderCurrentView();
+             renderColorLegend();
+             startTimeIndicator();
+         } else {
+             console.error("واکشی داده‌های هفته ناموفق بود.");
+         }
+    }
+
+
+    async function loadAndRender() {
+        stopPolling();
+        // (*** اصلاح‌شده ***) حالا به جای apiCall مستقیم، از تابع سراسری استفاده می‌کنیم
+        // تا هفته پیش‌فرض سرور لود شود
+        const result = await apiCall('getData', null, 'GET');
+        if (result && result.data) {
+            lastFetchedDataString = JSON.stringify(result.data.events || []);
+            fullData = result.data;
+
+            // (*** اصلاح‌شده ***) همیشه هفته جاری را بر اساس زمان سرور محاسبه کن
+            currentWeekStartDate = getStartDate(); // بدون ورودی، از زمان سرور استفاده می‌کند
+
+            document.title = fullData.settings?.headerText || "تقویم هفتگی";
+            // رندر اولیه
+            updateCalendarTitle();
+            renderCurrentView();
+            renderColorLegend();
+            startTimeIndicator();
+        } else {
+             console.error("لود اولیه داده‌ها ناموفق بود.");
+        }
+        startPolling();
+    }
+
+    // (*** جدید ***) آپدیت خودکار (Polling)
+    function startPolling() {
+        stopPolling();
+        // پاک کردن اینتروال قبلی اگر وجود داشت
+        console.log("Polling started...");
+        pollingInterval = setInterval(async () => {
+            // console.log("Polling check..."); // لاگ کمتر برای جلوگیری از شلوغی کنسول
+            const currentWeekStartStr = formatDate(currentWeekStartDate);
+            // فراخوانی API بدون نمایش لودر انجام می‌شود چون shouldShowLoader فالس است
+            const result = await apiCall('getData', { weekStartDate: currentWeekStartStr }, 'GET');
+            if (result
+             && result.data) {
+                const newDataString = JSON.stringify(result.data.events || []);
+                if (newDataString !== lastFetchedDataString) {
+                    console.log("Data changed, rendering...");
+                    lastFetchedDataString = newDataString;
+
+                    fullData.events = result.data.events || []; // آپدیت داده‌های محلی
+                    // آپدیت سایر داده‌ها
+                    fullData.users = result.data.users || [];
+                    fullData.departments = result.data.departments || [];
+
+
+                    fullData.holidays = result.data.holidays ||
+                     [];
+                    fullData.settings = result.data.settings || {}; // آپدیت تنظیمات
+                    renderCurrentView();
+                    // رندر مجدد
+                    renderColorLegend();
+                    // (*** اصلاح‌شده ***) آپدیت راهنمای رنگ
+                } else {
+                    // console.log("No changes detected.");
+                }
+            } else {
+                 console.error("Polling fetch failed.");
+                 // توقف polling در صورت خطا
+                 // stopPolling();
+            }
+        }, 5000);
+        // هر ۵ ثانیه
+    }
+
+    function stopPolling() {
+        if (pollingInterval) {
+            clearInterval(pollingInterval);
+            pollingInterval = null;
+            console.log("Polling stopped.");
+        }
+    }
+
+
+    function renderCurrentView() {
+        if (currentView === 'grid') {
+            calendarGridContainer.style.display = 'block';
+            calendarListContainer.style.display = 'none';
+            renderGridView();
+        } else {
+            calendarGridContainer.style.display = 'none';
+            calendarListContainer.style.display = 'block';
+            renderListView();
+        }
+        updateTimeIndicator();
+        // آپدیت نشانگر زمان در هر بار رندر
+    }
+
+    // به‌روزرسانی عنوان هدر با بازه تاریخی
+    function updateCalendarTitle() {
+        const start = new Date(currentWeekStartDate.getTime());
+        const end = new Date(start.getTime());
+        end.setDate(start.getDate() + 6);
+        const formatter = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long', year: 'numeric' });
+        if (start.getFullYear() === end.getFullYear()) {
+             const startStr = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(start);
+             const endStr = formatter.format(end);
+             calendarTitle.textContent = `(${toPersian(startStr)} - ${toPersian(endStr)})`;
+        } else {
+             calendarTitle.textContent = `(${toPersian(formatter.format(start))} - ${toPersian(formatter.format(end))})`;
+        }
+    }
+
+    function renderGridView() {
+        calendarGridContainer.innerHTML = '';
+        // پاک کردن محتوای قبلی
+        // اطمینان از اینکه holidays آرایه است
+        const holidays = Array.isArray(fullData.holidays) ?
+        fullData.holidays : [];
+
+
+        if (window.matchMedia("(max-width: 768px)").matches) {
+            document.body.classList.add('mobile-view');
+            createMobileGrid(holidays);
+            // (*** جدید ***) اعمال تنظیمات زوم موبایل
+            updateMobileViewCSS();
+        } else {
+            document.body.classList.remove('mobile-view');
+            createDesktopGrid(holidays);
+        }
+
+        const holidayEvents = holidays.map(h => {
+             const holidayDate = new Date(currentWeekStartDate.getTime());
+              // اطمینان از اینکه h.day عدد است
+             const dayOffset = parseInt(h.day, 10);
+             if (isNaN(dayOffset)) return null; // پرش از تعطیلات نامعتبر
+
+
+             holidayDate.setDate(holidayDate.getDate() + dayOffset);
+             return {
+                id: `h-${h.day}`,
+                title: h.occasion,
+                isAllDay: true,
+
+                startDateTime: `${formatDate(holidayDate)}T00:00:00`,
+                endDateTime: `${formatDate(holidayDate)}T24:00:00`,
+                color: '#e57373',
+                textColor: 'white',
+                status: 'approved',
+                isHoliday: true // (*** اصلاح‌شده ***) اضافه کردن فلگ برای تعطیلات
+
+            }
+        }).filter(Boolean);
+        // حذف موارد null
+
+        // اطمینان از اینکه events آرایه است
+        const validEvents = Array.isArray(fullData.events) ?
+        fullData.events : [];
+        const allEvents = validEvents.concat(holidayEvents);
+
+        renderAllEvents(allEvents);
+        applySmartContent();
+        createOrUpdateTimeIndicator();
+        // ایجاد یا آپدیت نشانگر زمان
+    }
+
+    // گرید دسکتاپ
+    function createDesktopGrid(holidays) {
+        calendarGridContainer.innerHTML = `<div class="calendar-grid"><div class="grid-header"><div class="header-corner"></div><div class="header-allday">تمام روز</div><div class="header-timeline"></div></div><div class="grid-body"></div></div>`;
+        const timelineHeader = calendarGridContainer.querySelector('.header-timeline');
+        timelineHeader.innerHTML = Array.from({ length: 48 }, (_, i) => `<div class="time-label">${i % 2 === 0 ? toPersian(Math.floor(i / 2)) + ':۰۰' : ''}</div>`).join('');
+        const gridBody = calendarGridContainer.querySelector('.grid-body');
+        const startDate = currentWeekStartDate;
+        for (let j = 0; j < 7; j++) {
+            const currentDate = new Date(startDate.getTime());
+            currentDate.setDate(startDate.getDate() + j);
+            const dateString = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(currentDate);
+            const dayRow = document.createElement('div');
+            dayRow.className = 'day-row'; dayRow.setAttribute('data-day-index', j);
+             // اطمینان از اینکه h.day عدد است
+            if (holidays.some(h => parseInt(h.day, 10) === j)) dayRow.classList.add('is-holiday');
+            dayRow.innerHTML = `<div class="day-label"><span>${WEEK_DAYS[j]}</span><span class="date">${toPersian(dateString)}</span></div><div class="all-day-cell"></div><div class="timeline-cell"></div>`;
+            gridBody.appendChild(dayRow);
+        }
+    }
+
+    // (*** اصلاح‌شده ***) گرید موبایل
+    function createMobileGrid(holidays) {
+        calendarGridContainer.innerHTML = `<div class="mobile-grid"><div class="mobile-time-axis"></div><div class="mobile-days-container"></div></div>`;
+        const timeAxis = calendarGridContainer.querySelector('.mobile-time-axis');
+
+        // (*** اصلاح‌شده ***) اضافه کردن سلول خالی بالا
+        timeAxis.innerHTML = `<div class="time-axis-corner"></div>`;
+        timeAxis.innerHTML += `<div class="time-label-mobile all-day-header">تمام روز</div>`;
+
+        // (*** اصلاح‌شده ***) ایجاد لیبل‌های زمان بر اساس زوم
+        // این بخش بعداً توسط updateMobileViewCSS مدیریت می‌شود، اما ساختار اولیه را می‌سازیم
+        for (let i = 0; i < 24; i++) {
+             const label = document.createElement('div');
+             label.className = 'time-label-mobile';
+             label.dataset.hour = i;
+             label.textContent = `${toPersian(i)}:۰۰`;
+             timeAxis.appendChild(label);
+        }
+
+        const daysContainer = calendarGridContainer.querySelector('.mobile-days-container');
+        const startDate = currentWeekStartDate;
+        for (let j = 0; j < 7; j++) {
+            const currentDate = new Date(startDate.getTime());
+            currentDate.setDate(startDate.getDate() + j);
+            const dateString = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(currentDate);
+            const dayColumn = document.createElement('div');
+            dayColumn.className = 'day-column'; dayColumn.setAttribute('data-day-index', j);
+             // اطمینان از اینکه h.day عدد است
+            if (holidays.some(h => parseInt(h.day, 10) === j)) dayColumn.classList.add('is-holiday');
+            dayColumn.innerHTML = `<div class="day-label"><span>${WEEK_DAYS[j]}</span><span class="date">${toPersian(dateString)}</span></div><div class="all-day-cell"></div><div class="timeline-cell"></div>`;
+            daysContainer.appendChild(dayColumn);
+        }
+    }
+
+    // (*** جدید ***) اعمال CSS برای زوم موبایل
+    function updateMobileViewCSS() {
+        const grid = document.querySelector('.mobile-grid');
+        if (!grid) return;
+
+        const timeAxis = grid.querySelector('.mobile-time-axis');
+
+        // 1. تنظیم تعداد روزهای افقی
+        grid.style.setProperty('--mobile-day-count', mobileViewConfig.dayCount);
+
+        // 2. تنظیم زوم عمودی (ساعت‌ها)
+        grid.style.setProperty('--mobile-hour-zoom', mobileViewConfig.hourZoom);
+
+        // 3. نمایش/مخفی کردن لیبل‌های ساعت بر اساس زوم
+        const labels = timeAxis.querySelectorAll('.time-label-mobile[data-hour]');
+        labels.forEach(label => {
+            const hour = parseInt(label.dataset.hour, 10);
+            let show = false;
+            if (mobileViewConfig.hourZoom === 1) { // 8 slots (0, 3, 6, ...)
+                show = (hour % 3 === 0);
+            } else if (mobileViewConfig.hourZoom === 2) { // 12 slots (0, 2, 4, ...)
+                show = (hour % 2 === 0);
+            } else { // 24 slots (levels 3 and 4)
+                show = true;
+            }
+            label.style.display = show ? 'flex' : 'none';
+        });
+    }
+
+
+    // منطق رندر DateTime
+    function renderAllEvents(events) {
+        let allDayEventsByDay = Array(7).fill(null).map(() => []);
+        let timedEventsByDay = Array(7).fill(null).map(() => []);
+        const MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+        const weekStart = new Date(currentWeekStartDate);
+        weekStart.setHours(0,0,0,0);
+        const weekStartMS = weekStart.getTime();
+
+        const weekEnd = new Date(weekStart);
+        weekEnd.setDate(weekEnd.getDate() + 7);
+        const weekEndMS = weekEnd.getTime();
+
+
+        for (const event of events) {
+             try {
+                 let eventStartDT, eventEndDT;
+                 // مدیریت حالت خاص 24:00 برای endDateTime
+                 let endStr = event.endDateTime;
+                 // (*** اصلاح‌شده ***) بررسی دقیق‌تر T24:00
+                 const isEndTime24 = endStr.includes('T24:00');
+
+                 if (isEndTime24) {
+                     // رشته تاریخ را استخراج کن (قبل از T)
+                     const datePart = endStr.substring(0, 10);
+                     // رشته آفست را استخراج کن (اگر وجود داشت)
+                     const offsetPart = endStr.substring(19); // e.g., +03:30
+                     // برای ساخت آبجکت Date، آن را به 23:59:59 همان روز تبدیل می‌کنیم
+                     endStr = `${datePart}T23:59:59${offsetPart || ''}`;
+                 }
+
+                 eventStartDT = new Date(event.startDateTime);
+                 eventEndDT = new Date(endStr);
+
+                 if (isNaN(eventStartDT) || isNaN(eventEndDT)) {
+                     console.warn("Invalid event date, skipping:", event);
+                     continue;
+                 }
+
+                 if (isEndTime24) {
+                     // حالا که آبجکت Date ساخته شد، 1 ثانیه اضافه می‌کنیم تا به نیمه‌شب روز بعد برود
+                     eventEndDT.setTime(eventEndDT.getTime() + 1000);
+                 }
+
+
+                const effectiveStartMS = Math.max(weekStartMS, eventStartDT.getTime());
+                let effectiveEndMS = Math.min(weekEndMS, eventEndDT.getTime());
+
+                // محاسبه روز شروع بر اساس اختلاف MS
+                let startDay = Math.floor((effectiveStartMS - weekStartMS) / MS_PER_DAY);
+                // محاسبه روز پایان
+                // (1- کم می‌کنیم تا مطمئن شویم 00:00 روز بعد، در روز قبل حساب شود)
+                let endDay = Math.floor((effectiveEndMS - weekStartMS - 1) / MS_PER_DAY);
+
+
+                if (startDay < 0) startDay = 0;
+                if (endDay >= 7) endDay = 6;
+                if (endDay < startDay) continue;
+
+                for (let day = startDay; day <= endDay; day++) {
+                    const chunk = { ...event, day: day };
+
+                    // محاسبه isMultiDayPart
+                    const eventStartDateOnly = new Date(eventStartDT.getFullYear(), eventStartDT.getMonth(), eventStartDT.getDate()).getTime();
+                    let eventEndDateOnly = new Date(eventEndDT.getFullYear(), eventEndDT.getMonth(), eventEndDT.getDate()).getTime();
+
+                    if (isEndTime24) {
+                        // اگر پایان 24:00 بود، یعنی متعلق به روز قبل است
+                        const tempEnd = new Date(eventEndDT.getTime() - 1000);
+                        eventEndDateOnly = new Date(tempEnd.getFullYear(), tempEnd.getMonth(), tempEnd.getDate()).getTime();
+                    }
+
+                    chunk.isMultiDayPart = (eventStartDateOnly !== eventEndDateOnly);
+
+                    // isStart و isEnd
+                    chunk.isStart = (day === startDay);
+                    chunk.isEnd = (day === endDay);
+
+                    // from
+                    const dayStartMS = weekStartMS + day * MS_PER_DAY;
+                    if (chunk.isStart && eventStartDT.getTime() > dayStartMS) {
+                        chunk.from = eventStartDT.toTimeString().substring(0, 5);
+                    } else {
+                        chunk.from = "00:00";
+                    }
+
+                    // to
+                    const dayEndMS = weekStartMS + (day + 1) * MS_PER_DAY;
+                    let chunkEndTimeStr = eventEndDT.toTimeString().substring(0, 5);
+
+                    // اگر زمان پایان 00:00 بود (و مال روز بعد بود)، آن را 24:00 در نظر بگیر
+                    if (chunkEndTimeStr === "00:00" && eventEndDT.getTime() > eventStartDT.getTime() ) {
+                         chunkEndTimeStr = "24:00";
+                    }
+
+                    if (chunk.isEnd && eventEndDT.getTime() < dayEndMS) {
+                        chunk.to = chunkEndTimeStr;
+                    } else {
+                        chunk.to = "24:00";
+                    }
+
+
+                    if(event.isAllDay) {
+                        chunk.from = "00:00";
+                        chunk.to = "24:00";
+                        allDayEventsByDay[day].push(chunk);
+                    }
+                    else {
+                        timedEventsByDay[day].push(chunk);
+                    }
+                }
+             } catch (e) { console.error("Error processing event:", event, e);
+             }
+        }
+
+        // رندر در DOM ...
+        for (let day = 0; day < 7; day++) {
+            const dayContainer = document.querySelector(`[data-day-index="${day}"]`);
+            if (!dayContainer) continue;
+            const allDayCell = dayContainer.querySelector('.all-day-cell');
+            const allDayEvents = allDayEventsByDay[day];
+            if (allDayEvents.length > 0) {
+                allDayCell.style.setProperty('--event-count', allDayEvents.length);
+                allDayEvents.forEach(event => createEventDiv(event, allDayCell, true));
+            }
+            const timelineCell = dayContainer.querySelector('.timeline-cell');
+            const timedEvents = timedEventsByDay[day].sort((a, b) => timeToMinutes(a.from) - timeToMinutes(b.from));
+            if (timedEvents.length > 0) processAndRenderTimedEvents(timedEvents, timelineCell);
+        }
+         // بعد از رندر کردن، استایل محتوا را آپدیت کن
+         applySmartContent();
+    }
+     // Helper function for checking end of string (compatibility)
+     function strEndsWith(str, suffix) {
+         if (!str || !suffix) return false;
+         return str.indexOf(suffix, str.length - suffix.length) !== -1;
+     }
+
+    function createEventDiv(event, container, isAllDay = false) {
+        const eventDiv = document.createElement('div');
+        eventDiv.className = isAllDay ? 'event-allday' : 'event';
+        eventDiv.classList.add(`status-${event.status || 'approved'}`);
+        if (event.status === 'approved') { eventDiv.style.backgroundColor = event.color;
+        eventDiv.style.color = event.textColor || 'white'; }
+        if (event.isMultiDayPart) { eventDiv.dataset.ismultiday = true;
+        if (event.isStart) eventDiv.dataset.isstart = true; if (event.isEnd) eventDiv.dataset.isend = true;
+        }
+
+        let isLocked = false;
+        if (CURRENT_USER.role !== 'manager' && CURRENT_USER.role !== 'evaluator') {
+             // قفل است اگر: ۱- تایید شده باشد ۲- متعلق به کاربر نباشد ۳- یا کاربر بیننده باشد
+            if((event.status === 'approved') || (event.proposerId !== CURRENT_USER.id) || CURRENT_USER.role === 'viewer') {
+                isLocked = true;
+            }
+        }
+        // مدیر یا ارزیاب هرگز قفل نیستند
+
+
+        if(isLocked) eventDiv.classList.add('event-locked');
+        eventDiv.dataset.event = JSON.stringify(event);
+        eventDiv.dataset.locked = isLocked;
+        container.appendChild(eventDiv);
+        return eventDiv;
+    }
+
+    // Process and render timed events
+    function processAndRenderTimedEvents(dayEvents, timelineCell) {
+        const isMobile = document.body.classList.contains('mobile-view');
+        dayEvents.forEach(event => { event.start = timeToMinutes(event.from); event.end = timeToMinutes(event.to); });
+        let i = 0;
+        while (i < dayEvents.length) {
+            let overlappingGroup = [dayEvents[i]];
+            let maxEnd = dayEvents[i].end;
+            for (let j = i + 1; j < dayEvents.length; j++) { if (dayEvents[j].start < maxEnd) { overlappingGroup.push(dayEvents[j]);
+            if (dayEvents[j].end > maxEnd) maxEnd = dayEvents[j].end; } else break;
+            }
+            const lanes = [];
+            overlappingGroup.sort((a,b) => a.start - b.start).forEach(event => { let placed = false; for (const lane of lanes) { if (event.start >= lane[lane.length - 1].end) { lane.push(event); placed = true; break; } } if (!placed) lanes.push([event]); });
+            const totalLanes = lanes.length;
+            lanes.forEach((lane, laneIndex) => {
+                lane.forEach(event => {
+                    const eventWrapper = document.createElement('div'); eventWrapper.className = 'event-wrapper';
+                    const totalMinutesInView = 24 * 60;
+                    const startOffsetMinutes = event.start;
+
+                    const durationMinutes = event.end - event.start;
+                    // جلوگیری از ارتفاع/عرض منفی یا صفر
+                    if (durationMinutes <= 0) return;
+
+                    if (isMobile) {
+
+
+                         eventWrapper.style.top = `${(startOffsetMinutes / totalMinutesInView) * 100}%`; eventWrapper.style.height = `${(durationMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.left = `${(laneIndex / totalLanes) * 100}%`; eventWrapper.style.width = `${100 / totalLanes}%`;
+
+                     } else {
+                        eventWrapper.style.right = `${(startOffsetMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.width = `${(durationMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.top = `${(laneIndex / totalLanes) * 100}%`; eventWrapper.style.height = `${100 / totalLanes}%`;
+                    }
+                    createEventDiv(event, eventWrapper, false);
+                    timelineCell.appendChild(eventWrapper);
+                });
+            });
+            i += overlappingGroup.length;
+        }
+    }
+
+     // (*** اصلاح‌شده ***) رفع مشکل نمایش تعطیلات
+    function applySmartContent() {
+        document.querySelectorAll('.event-allday, .event').forEach(eventDiv => {
+             // پاک کردن محتوای قبلی قبل از بازسازی
+             eventDiv.innerHTML = '';
+
+            const event = JSON.parse(eventDiv.dataset.event);
+
+
+            const isAllDay = eventDiv.classList.contains('event-allday');
+             const isHoliday = event.isHoliday || (event.id && String(event.id).startsWith('h-')); // (*** جدید ***)
+            const availableHeight = eventDiv.clientHeight;
+            const availableWidth = eventDiv.clientWidth;
+
+             // محاسبه فضای موجود برای محتوا (با کم کردن فضای احتمالی دپارتمان)
+
+            const hasDeptLabel = !!getDepartmentLabel(event, true); // فقط بررسی کن آیا لیبل وجود دارد
+
+             const contentAvailableWidth = availableWidth - (hasDeptLabel ? 20 : 0); // حدود 20 پیکسل برای لیبل عمودی
+
+            // (*** اصلاح‌شده ***) متا را برای تعطیلات نشان نده
+             let showMeta = !isHoliday && (isAllDay ?
+ (availableHeight >= 45) : (contentAvailableWidth >= 70 && availableHeight >= 45));
+             let ultraCondensed = isAllDay ?
+ (availableHeight < 25) : (contentAvailableWidth < 40 || availableHeight < 25);
+             // ساخت محتوای اصلی
+             let contentHTML = `<div class="event-title">${event.title ||
+ ''}</div>`; // عنوان همیشه نمایش داده شود
+
+             if (showMeta && event.isStart) { // متا فقط در روز شروع
+                 contentHTML += `<div class="event-meta">${event.by ||
+ '-'}</div>
+                                 <div class="event-meta">${event.for ||
+ '-'}</div>`;
+            }
+
+             // ساخت لیبل دپارتمان
+             const deptLabelHTML = getDepartmentLabel(event);
+             // لیبل دپارتمان را بگیر
+
+             // اضافه کردن به DOM
+             eventDiv.innerHTML = deptLabelHTML + `<div class="event-content">${contentHTML}</div>`;
+             // اول لیبل بعد محتوا
+
+            // اعمال کلاس فشرده
+            if (ultraCondensed) eventDiv.classList.add('event-ultra-condensed');
+            else eventDiv.classList.remove('event-ultra-condensed');
+        });
+    }
+
+    // (*** اصلاح‌شده ***) حذف شرط مخفی کردن دپارتمان
+    function getDepartmentLabel(event, checkOnly = false) {
+        // لیبل فقط در روز شروع
+        if (!event.departmentId || !event.isStart ) return '';
+        // (*** اصلاح‌شده ***) این شرط حذف شد تا همه دپارتمان‌ها نمایش داده شوند
+        // const shouldShow = (CURRENT_USER.role === 'manager' || CURRENT_USER.role === 'evaluator') ||
+        //                   (event.departmentId !== CURRENT_USER.departmentId);
+        const shouldShow = true;
+
+        if (shouldShow) {
+             if (checkOnly) return true;
+            // فقط برای بررسی وجود لیبل
+            const dept = (fullData.departments || []).find(d => d.id === event.departmentId);
+            if (dept) return `<div class="event-dept vertical">${dept.name}</div>`; // کلاس vertical اضافه شد
+        }
+        return checkOnly ?
+        false : '';
+    }
+
+    // (*** اصلاح‌شده ***) تابع getStartDate برای استفاده از زمان محلی به جای UTC
+    function getStartDate(gregorianDateStr = null) {
+        let referenceDate = new Date(); // Fallback
+
+        if (gregorianDateStr && /^\d{4}-\d{2}-\d{2}$/.test(gregorianDateStr)) {
+            // اگر رشته تاریخ معتبر بود (مثلا از تنظیمات)
+            const [year, month, day] = gregorianDateStr.split('-').map(Number);
+            // آن را به عنوان تاریخ *محلی* (Local) بساز، نه UTC
+            referenceDate = new Date(year, month - 1, day, 12, 0, 0); // ساعت 12 ظهر برای جلوگیری از باگ DST
+        } else {
+            // اگر رشته تاریخ نداشتیم، از زمان فعلی سرور (که به درستی منطقه زمانی دارد) استفاده کن
+            try {
+                referenceDate = new Date(CURRENT_SERVER_TIME_ISO);
+            } catch(e) { referenceDate = new Date(); }
+        }
+
+        if (isNaN(referenceDate)) { // Fallback نهایی
+             referenceDate = new Date();
+             console.error("Invalid date, falling back to client's current date.");
+        }
+
+        // حالا شنبه همان هفته را (بر اساس زمان محلی) پیدا کن
+        // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+        const currentDay = referenceDate.getDay();
+
+        // (currentDay + 1) % 7
+        // شنبه (6) -> (6+1) % 7 = 0
+        // یکشنبه (0) -> (0+1) % 7 = 1
+        // دوشنبه (1) -> (1+1) % 7 = 2
+        const diffToSat = (currentDay + 1) % 7; // تعداد روزهایی که باید به عقب برگردیم
+
+        referenceDate.setDate(referenceDate.getDate() - diffToSat);
+        referenceDate.setHours(0, 0, 0, 0); // تنظیم به نیمه‌شب
+
+        return referenceDate;
+    }
+
+
+    // (*** اصلاح‌شده ***) فیلتر کردن راهنمای رنگ بر اساس دسترسی
+    function renderColorLegend() {
+        let html = '<h4>راهنمای دپارتمان‌ها</h4><ul>';
+        const allDepts = Array.isArray(fullData.departments) ? fullData.departments : [];
+        let visibleDepts = [];
+        // مدیر، ارزیاب یا کسی که دسترسی دیدن همه‌ی دپارتمان‌ها را دارد
+        if (CURRENT_USER.role === 'manager' || CURRENT_USER.role === 'evaluator' || (CURRENT_USER.permissions?.view_all_depts)) {
+            visibleDepts = allDepts;
+        } else {
+            // دیگران فقط دپارتمان خودشان + دپارتمان‌هایی که مجوز دارند را می‌بینند
+            const visibleIds = new Set(CURRENT_USER.permissions?.view_depts || []);
+            if (CURRENT_USER.departmentId) {
+                visibleIds.add(CURRENT_USER.departmentId);
+            }
+            visibleDepts = allDepts.filter(dept => visibleIds.has(dept.id));
+        }
+
+        visibleDepts.forEach(dept => {
+             html += `<li><span class="legend-swatch" style="background-color: ${dept.color || '#ccc'}"></span>${dept.name || 'ناشناخته'}</li>`;
+        });
+        html += '</ul>';
+        if (legendPopup) legendPopup.innerHTML = html;
+    }
+
+
+    // (*** اصلاح‌شده ***) اضافه کردن رنگ به نمای لیست
+    function renderListView() {
+        calendarListContainer.innerHTML = '';
+        const events = (Array.isArray(fullData.events) ? fullData.events : []).filter(e => e.status === 'approved' || e.status === 'pending');
+        events.sort((a, b) => (new Date(a.startDateTime) - new Date(b.startDateTime)));
+        if (events.length === 0) { calendarListContainer.innerHTML = '<h2>نمای لیستی</h2><p>هیچ رویدادی برای این هفته یافت نشد.</p>';
+        return; }
+
+        let currentDay = -1; let html = '';
+        const dayFormatter = new Intl.DateTimeFormat('fa-IR', { weekday: 'long' });
+        const timeFormatter = new Intl.DateTimeFormat('fa-IR', { hour: '2-digit', minute: '2-digit', hour12: false });
+        // 24 ساعته
+
+        events.forEach(event => {
+            try {
+                const startDT = new Date(event.startDateTime);
+                let endDT = new Date(event.endDateTime);
+                let endTimeStr = event.endDateTime.substring(11, 16);
+
+
+                const isEndTime24 = event.endDateTime.includes('T24:00');
+                 if (isEndTime24) {
+                      // برای نمایش، 24:00 را به 00:00 تبدیل می‌کنیم
+                      endTimeStr = '00:00';
+                      // آبجکت Date را برای نمایش روز درست، 1 ثانیه به عقب می‌بریم
+                      endDT = new Date(new Date(event.endDateTime).getTime() - 1000);
+                 } else {
+                     endTimeStr = timeFormatter.format(endDT);
+                 }
+
+
+
+                const dayIndex = getDayIndexFromDateTime(event.startDateTime); // استفاده از تابع کمکی
+
+                 if (dayIndex !== currentDay) { currentDay = dayIndex; html += `<h2>${toPersian(dayFormatter.format(startDT))}</h2>`;
+                 }
+
+                 const startTimeStr = timeFormatter.format(startDT);
+                 const startDateStr = dayFormatter.format(startDT);
+                 const endDateStr = dayFormatter.format(endDT);
+                 // روز قبل برای حالت 24:00
+
+                 const time = event.isAllDay
+                    ?
+                    `(تمام روز ${toPersian(startDateStr)})` // نمایش ساده‌تر برای تمام روز
+                    : `${toPersian(startTimeStr)} (${toPersian(startDateStr)}) الی ${toPersian(endTimeStr)} (${toPersian(endDateStr)})`;
+                 const dept = (fullData.departments || []).find(d => d.id === event.departmentId);
+                 const statusClass = `status-${event.status}`;
+                 // (*** جدید ***) اضافه کردن استایل رنگ
+                 let colorStyle = '';
+                 if (event.status === 'approved' && event.color) {
+                     colorStyle = `style="border-right-color: ${event.color};"`;
+                 }
+
+                 html += `
+                    <div class="list-view-item ${statusClass}" ${colorStyle}>
+                        <div class="list-view-time"> ${time} <div class="list-day">${dept ?
+                        dept.name : 'عمومی'}</div> </div>
+                        <div class="list-view-details"> <h4>${event.title} ${event.status === 'pending' ?
+                        '(در انتظار)' : ''}</h4> <span>مجری: ${event.by || '-'}</span> <span>مخاطب: ${event.for ||
+                        '-'}</span> </div>
+                        <div class="list-view-goal"> <h5>هدف:</h5> <p>${event.goal ||
+                        '(ثبت نشده)'}</p> </div>
+                    </div>`;
+            } catch (e) { console.error("Error rendering list view item:", event, e); }
+        });
+        calendarListContainer.innerHTML = html;
+    }
+
+
+    // ===================================================================
+    // 4. EVENT MODAL LOGIC (*** اصلاح‌شده برای استایل قبلی و DateTime ***)
+    // ===================================================================
+
+    function openEventModal(event = null) {
+        eventForm.reset();
+        approvalActions.style.display = 'none';
+        deleteEventBtn.style.display = 'none';
+        saveEventBtn.textContent = 'ذخیره';
+        saveEventBtn.style.display = 'block';
+        managerColorInputs.style.display = 'none';
+        eventGoalGroup.style.display = 'block';
+        eventForm.querySelectorAll('input, select, textarea').forEach(el => el.disabled = false);
+
+        if (event) {
+            // --- حالت ویرایش / بررسی ---
+            eventIdInput.value = event.id;
+            eventTitleInput.value = event.title || '';
+            eventByInput.value = event.by || '';
+            eventForInput.value = event.for || '';
+            eventGoalInput.value = event.goal || '';
+            isAllDayCheckbox.checked = event.isAllDay || false;
+
+            try {
+                 const startDT = new Date(event.startDateTime);
+                 let endDT, endTimeStr;
+
+                 const isEndTime24 = event.endDateTime.includes('T24:00');
+
+                 if (isEndTime24) {
+                      endTimeStr = '24:00';
+                      // برای پیدا کردن روز، 1 ثانیه کم می‌کنیم
+                      endDT = new Date(new Date(event.endDateTime).getTime() - 1000);
+                 } else {
+                     endDT = new Date(event.endDateTime);
+                     endTimeStr = endDT.toTimeString().substring(0, 5);
+                 }
+
+
+                 if (!isNaN(startDT)) {
+                    startDaySelect.value = getDayIndexFromDateTime(event.startDateTime);
+                    startTimeInput.value = startDT.toTimeString().substring(0, 5);
+                 } else { // Fallback if start date is invalid
+                     const todayIndex = getTehranParts(new Date(CURRENT_SERVER_TIME_ISO)).dayIndex;
+                     startDaySelect.value = todayIndex;
+                     startTimeInput.value = "09:00";
+                 }
+
+                 if (!isNaN(endDT)) {
+                     endDaySelect.value = getDayIndexFromDateTime(endDT.toISOString());
+                     endTimeInput.value = endTimeStr;
+                 } else {
+                     endDaySelect.value = startDaySelect.value;
+                     endTimeInput.value = "10:00";
+                 }
+
+
+            } catch (e) {
+                 console.error("Error parsing event dates for modal:", event, e);
+                 // Fallback values if date parsing fails
+                 const todayIndex = getTehranParts(new Date(CURRENT_SERVER_TIME_ISO)).dayIndex;
+                 startDaySelect.value = todayIndex; startTimeInput.value = "09:00";
+                 endDaySelect.value = todayIndex; endTimeInput.value = "10:00";
+            }
+
+
+            const canApprove = CURRENT_USER.role === 'manager' ||
+            CURRENT_USER.role === 'evaluator';
+            const isOwner = event.proposerId === CURRENT_USER.id;
+            const isApproved = event.status === 'approved';
+            // منطق نمایش دکمه‌ها و قفل کردن فرم
+             if (canApprove) {
+                 eventModalTitle.textContent = 'ویرایش / تایید رویداد';
+                 if (event.status === 'pending') approvalActions.style.display = 'flex';
+                 deleteEventBtn.style.display = 'block';
+                 // فیلدها قابل ویرایش هستند
+             } else if (isOwner && !isApproved) {
+                 eventModalTitle.textContent = 'ویرایش پیشنهاد';
+                 deleteEventBtn.style.display = 'block';
+                 // فیلدها قابل ویرایش هستند
+             } else { // رویداد تایید شده متعلق به دیگری، یا کاربر بیننده
+                 eventModalTitle.textContent = 'مشاهده رویداد';
+                 eventForm.querySelectorAll('input, select, textarea').forEach(el => el.disabled = true);
+                 saveEventBtn.style.display = 'none';
+                 deleteEventBtn.style.display = 'none';
+                 approvalActions.style.display = 'none';
+             }
+
+            // هدف فقط برای مدیر/ارزیاب
+            if (CURRENT_USER.role === 'proposer' || CURRENT_USER.role === 'viewer') {
+                eventGoalGroup.style.display = 'none';
+            }
+
+        } else {
+            // --- حالت افزودن جدید ---
+            eventIdInput.value = '';
+            eventGoalInput.value = '';
+            const todayIndex = getTehranParts(new Date(CURRENT_SERVER_TIME_ISO)).dayIndex;
+            startDaySelect.value = todayIndex;
+            startTimeInput.value = '09:00';
+            endDaySelect.value = todayIndex; endTimeInput.value = '10:00';
+
+            if (CURRENT_USER.role === 'manager') { eventModalTitle.textContent = 'افزودن رویداد مستقیم';
+            managerColorInputs.style.display = 'block'; eventGoalGroup.style.display = 'block'; }
+            else if (CURRENT_USER.role === 'evaluator') { eventModalTitle.textContent = 'افزودن رویداد (ارزیاب)';
+            eventGoalGroup.style.display = 'block'; }
+            else { eventModalTitle.textContent = 'پیشنهاد رویداد جدید';
+            eventGoalGroup.style.display = 'none'; }
+        }
+
+        isAllDayCheckbox.dispatchEvent(new Event('change'));
+        eventModal.style.display = 'flex';
+    }
+
+    function closeEventModal() { eventModal.style.display = 'none';
+    }
+
+    async function handleEventFormSubmit(e) {
+        e.preventDefault();
+        // اعتبار سنجی ورودی زمان در فرانت‌اند
+         const startTimeValue = startTimeInput.value.trim();
+         const endTimeValue = endTimeInput.value.trim();
+         const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/; // HH:MM (00:00 - 23:59)
+         const endTime24Regex = /^24:00$/;
+         // ویژه برای 24:00
+
+         if (!isAllDayCheckbox.checked) { // فقط برای رویدادهای غیر تمام روز
+             if (!timeRegex.test(startTimeValue)) {
+                 alert('فرمت ساعت شروع نامعتبر است. لطفاً از فرمت HH:MM بین 00:00 تا 23:59 استفاده کنید.');
+                 startTimeInput.focus();
+                 return;
+             }
+             if (!timeRegex.test(endTimeValue) && !endTime24Regex.test(endTimeValue)) {
+                 alert('فرمت ساعت پایان نامعتبر است. لطفاً از فرمت HH:MM بین 00:00 تا 23:59 یا فقط 24:00 استفاده کنید.');
+                 endTimeInput.focus();
+                 return;
+             }
+         }
+
+         // (*** اصلاح‌شده ***) تبدیل روز/زمان به DateTime با آفست
+         const startDateTime = combineDateTime(startDaySelect.value, isAllDayCheckbox.checked ? "00:00" : startTimeValue);
+         const endDateTime = combineDateTime(endDaySelect.value, isAllDayCheckbox.checked ? "24:00" : endTimeValue);
+
+         if (!startDateTime || !endDateTime) {
+              alert("خطا در تبدیل تاریخ/زمان. ورودی‌ها را بررسی کنید.");
+              return;
+         }
+
+          // اعتبار سنجی منطقی تاریخ/زمان
+          // (*** اصلاح‌شده ***) برای مدیریت آفست، از آبجکت Date برای مقایسه استفاده می‌کنیم
+          // نکته: ساخت Date از رشته ISO با آفست به درستی کار می‌کند
+          const startTestDT = new Date(startDateTime);
+          let endTestDT;
+
+          if (endDateTime.includes('T24:00:00')) {
+              // برای مقایسه، 24:00 را به 00:00 روز بعد تبدیل می‌کنیم
+              const datePart = endDateTime.substring(0, 10);
+              const offsetPart = endDateTime.substring(19);
+              const tempDate = new Date(`${datePart}T00:00:00${offsetPart}`);
+              tempDate.setDate(tempDate.getDate() + 1); // برو به روز بعد
+              endTestDT = tempDate;
+          } else {
+              endTestDT = new Date(endDateTime);
+          }
+
+
+          if (endTestDT <= startTestDT) {
+              alert("تاریخ و ساعت پایان باید بعد از تاریخ و ساعت شروع باشد.");
+              return;
+          }
+
+
+        const eventData = {
+            id: eventIdInput.value ||
+            null,
+            title: eventTitleInput.value.trim(),
+            by: eventByInput.value.trim(),
+            for: eventForInput.value.trim(),
+            goal: eventGoalInput.value.trim(),
+            isAllDay: isAllDayCheckbox.checked,
+            startDateTime: startDateTime, // ارسال فرمت ISO با آفست
+            endDateTime: endDateTime, // ارسال فرمت ISO با آفست
+        };
+        if (CURRENT_USER.role === 'manager' && !eventData.id) { // فقط مدیر برای رویداد جدید
+            eventData.color = document.getElementById('eventBgColor').value;
+            eventData.textColor = document.getElementById('eventTextColor').value;
+        }
+         // اگر مدیر یا ارزیاب در حال ویرایش بودند، وضعیت را هم ارسال کن
+         if (eventData.id && (CURRENT_USER.role === 'manager' || CURRENT_USER.role === 'evaluator')) {
+              // در اینجا میتوانستیم وضعیت را هم بخوانیم، اما api.php آن را هندل میکند اگر ارسال نشود
+              // eventData.status = ...
+
+         }
+
+
+        const result = await apiCall('saveEvent', { event: eventData }, 'POST');
+        if (result) {
+            alert(result.message);
+            closeEventModal();
+            await fetchAndRenderCurrentWeekData();
+            // (*** اصلاح‌شده ***) این فراخوانی اکنون کار می‌کند
+        }
+    }
+
+    async function handleEventStatusUpdate(status) {
+        const eventId = eventIdInput.value;
+        if (!eventId) return;
+        const result = await apiCall('updateEventStatus', { id: eventId, status: status }, 'POST');
+        if (result) {
+            alert(result.message);
+            closeEventModal();
+            await fetchAndRenderCurrentWeekData();
+        }
+    }
+
+    async function handleEventDelete() {
+        const eventId = eventIdInput.value;
+        if (!eventId) return;
+        if (!confirm('آیا از حذف این رویداد مطمئن هستید؟')) return;
+
+        const result = await apiCall('deleteEvent', { id: eventId }, 'POST');
+        if (result) {
+            alert(result.message);
+            closeEventModal();
+            await fetchAndRenderCurrentWeekData();
+        }
+    }
+
+    // ===================================================================
+    // 5. SETTINGS MODAL (*** پیاده‌سازی شد ***)
+    // ===================================================================
+
+    // (*** پیاده‌سازی شد ***)
+    function generateWeeks() {
+        if (!weekSelector) return;
+        weekSelector.innerHTML = '';
+
+        // از 4 هفته قبل شروع کن
+        let currentSat = getStartDate(formatDate(currentWeekStartDate));
+        currentSat.setDate(currentSat.getDate() - (4 * 7));
+
+        const formatter = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long', year: 'numeric' });
+
+        for (let i = 0; i < 12; i++) { // 4 هفته قبل + 1 جاری + 7 هفته بعد
+            const satStr = formatDate(currentSat);
+            const endOfWeek = new Date(currentSat);
+            endOfWeek.setDate(currentSat.getDate() + 6);
+
+            const option = document.createElement('option');
+            option.value = satStr;
+            option.textContent = `( ${toPersian(formatter.format(currentSat))} - ${toPersian(formatter.format(endOfWeek))} )`;
+
+            // هفته جاری را انتخاب کن
+            if (satStr === formatDate(currentWeekStartDate)) {
+                option.selected = true;
+            }
+
+            weekSelector.appendChild(option);
+            currentSat.setDate(currentSat.getDate() + 7);
+        }
+    }
+
+    // (*** پیاده‌سازی شد ***)
+    function openSettingsModal() {
+        if (!settingsModal) return;
+        mainHeaderInput.value = fullData.settings?.headerText || '';
+
+        // (*** اصلاح‌شده ***) هفته جاری واقعی را به عنوان پیش‌فرض در select نشان بده
+        const actualCurrentWeek = formatDate(currentWeekStartDate);
+
+        generateWeeks(); // لیست هفته‌ها را بساز
+
+        // هفته جاری واقعی را انتخاب کن
+        let found = false;
+        Array.from(weekSelector.options).forEach(opt => {
+             if (opt.value === actualCurrentWeek) {
+                 opt.selected = true;
+                 found = true;
+             }
+        });
+        // اگر هفته جاری واقعی در لیست نبود (بعید)، اولین گزینه را انتخاب کن
+        if (!found && weekSelector.options.length > 0) {
+             weekSelector.options[0].selected = true;
+        }
+
+        settingsModal.style.display = 'flex';
+    }
+
+    async function handleSettingsSave() {
+
+
+      const newSettings = { headerText: mainHeaderInput.value, weekStartDate: weekSelector.value };
+      const result = await apiCall('saveSettings', newSettings, 'POST');
+         if (result) {
+             alert(result.message);
+             settingsModal.style.display = 'none';
+             stopPolling(); // توقف polling قبل از تغییر هفته
+             currentWeekStartDate = getStartDate(newSettings.weekStartDate);
+             // آپدیت هفته جاری
+             // (*** اصلاح‌شده ***) فراخوانی تابع سراسری
+             document.title = newSettings.headerText; // آپدیت عنوان صفحه
+             await fetchAndRenderCurrentWeekData();
+             // واکشی و رندر هفته جدید
+             startPolling();
+             // شروع مجدد polling
+         }
+     }
+
+
+    // ===================================================================
+    // 6. DEPARTMENTS MODAL (*** توابع خالی پیاده‌سازی شدند ***)
+    // ===================================================================
+     function renderDeptsEditor() {
+        if (!deptsListEditor) return;
+        deptsListEditor.innerHTML = '';
+        (fullData.departments || []).forEach(dept => {
+            deptsListEditor.appendChild(createDeptEditorRow(dept));
+        });
+     }
+
+     function createDeptEditorRow(dept = null) {
+        const row = document.createElement('div');
+        row.className = 'dept-item';
+        const id = dept ? (dept.id || '') : ('new_' + Date.now());
+        row.dataset.id = id;
+
+        row.innerHTML = `
+            <input type.text" class="dept-name" placeholder="نام دپارتمان" value="${dept ? (dept.name || '') : ''}">
+            <input type="color" class="dept-color" value="${dept ? (dept.color || '#cccccc') : '#cccccc'}">
+            <button type="button" class="dept-remove danger-btn small-btn">حذف</button>
+        `;
+        row.querySelector('.dept-remove').addEventListener('click', () => row.remove());
+        return row;
+     }
+
+     function openDeptsModal() {
+        if (!deptsModal) return;
+        renderDeptsEditor();
+        deptsModal.style.display = 'flex';
+     }
+
+     function addNewDeptEditorRow() {
+         if (!deptsListEditor) return;
+         deptsListEditor.appendChild(createDeptEditorRow());
+     }
+
+     async function handleDeptsSave() {
+        const rows = deptsListEditor.querySelectorAll('.dept-item');
+        const departments = [];
+        let valid = true;
+        rows.forEach(row => {
+            const name = row.querySelector('.dept-name').value.trim();
+            const color = row.querySelector('.dept-color').value;
+            if (name && color) {
+                departments.push({
+                    id: row.dataset.id.startsWith('new_') ? null : row.dataset.id,
+                    name: name,
+                    color: color
+                });
+            } else if (name || color) { // فقط اگر یکی پر شده بود
+                valid = false;
+            }
+        });
+
+        if (!valid) {
+            alert('لطفاً نام و رنگ را برای همه دپارتمان‌ها مشخص کنید.');
+            return;
+        }
+
+        const result = await apiCall('manageDepartments', { departments: departments }, 'POST');
+        if (result) {
+            alert(result.message);
+            deptsModal.style.display = 'none';
+            await fetchAndRenderCurrentWeekData(); // رفرش داده‌ها
+        }
+     }
+
+    // ===================================================================
+    // 7. USERS MODAL (*** توابع خالی پیاده‌سازی شدند ***)
+    // ===================================================================
+     function renderUsersEditor() {
+         if (!usersListEditor) return;
+         usersListEditor.innerHTML = '';
+         (fullData.users || []).forEach(user => {
+             usersListEditor.appendChild(createUserEditorRow(user));
+         });
+     }
+
+     function createUserEditorRow(user = null) {
+        const isNew = user === null;
+        const u = user || { id: null, username: '', displayName: '', role: 'viewer', departmentId: null, permissions: { view_all_depts: false, view_depts: [], view_all_users: false, view_users: [] } };
+
+        const row = document.createElement('div');
+        row.className = 'user-item';
+        row.dataset.id = u.id || 'new_' + Date.now();
+
+        // گزینه‌های دپارتمان
+        let deptOptions = '<option value="">(هیچکدام)</option>';
+        (fullData.departments || []).forEach(d => {
+            deptOptions += `<option value="${d.id}" ${u.departmentId === d.id ? 'selected' : ''}>${d.name}</option>`;
+        });
+
+        // گزینه‌های نقش
+        const roles = ['manager', 'evaluator', 'proposer', 'viewer'];
+        let roleOptions = '';
+        roles.forEach(r => {
+            roleOptions += `<option value="${r}" ${u.role === r ? 'selected' : ''}>${r}</option>`;
+        });
+
+        // چک‌باکس‌های دسترسی
+        let deptPerms = '';
+        (fullData.departments || []).forEach(d => {
+            deptPerms += `<label><input type="checkbox" class="perm-view-dept" value="${d.id}" ${u.permissions.view_depts.includes(d.id) ? 'checked' : ''}> ${d.name}</label>`;
+        });
+
+        let userPerms = '';
+        (fullData.users || []).filter(usr => usr.id !== u.id).forEach(usr => {
+             userPerms += `<label><input type="checkbox" class="perm-view-user" value="${usr.id}" ${u.permissions.view_users.includes(usr.id) ? 'checked' : ''}> ${usr.displayName}</label>`;
+        });
+
+
+        row.innerHTML = `
+            <div class="form-group"> <label>نام کاربری</label> <input type="text" class="user-username" value="${u.username}"> </div>
+            <div class="form-group"> <label>نام نمایشی</label> <input type="text" class="user-displayName" value="${u.displayName}"> </div>
+            <div class="form-group"> <label>رمز عبور (خالی=بدون تغییر)</label> <input type="password" class="user-password" placeholder="${isNew ? 'الزامی' : 'بدون تغییر'}"> </div>
+            <div class="form-group"> <label>نقش</label> <select class="user-role">${roleOptions}</select> </div>
+            <div class="form-group"> <label>دپارتمان</label> <select class="user-departmentId">${deptOptions}</select> </div>
+
+            <div class="user-item-permissions">
+                 <div class="permission-group">
+                    <h5>دسترسی دپارتمان‌ها</h5>
+                    <label><input type="checkbox" class="perm-view-all-depts" ${u.permissions.view_all_depts ? 'checked' : ''}> <b>مشاهده همه دپارتمان‌ها</b></label>
+                    <div class="permission-group-items">${deptPerms || '(دپارتمانی یافت نشد)'}</div>
+                 </div>
+                 <div class="permission-group">
+                    <h5>دسترسی کاربران</h5>
+                    <label><input type="checkbox" class="perm-view-all-users" ${u.permissions.view_all_users ? 'checked' : ''}> <b>مشاهده همه کاربران</b></label>
+                    <div class="permission-group-items">${userPerms || '(کاربر دیگری یافت نشد)'}</div>
+                 </div>
+            </div>
+
+            <div class="user-item-actions">
+                <button type="button" class="user-save primary-btn small-btn">ذخیره</button>
+                ${!isNew ? `<button type="button" class="user-delete danger-btn small-btn">حذف</button>` : ''}
+            </div>
+        `;
+
+        // Event Listeners
+        row.querySelector('.user-save').addEventListener('click', () => handleUserSave(row));
+        if (!isNew) {
+            row.querySelector('.user-delete').addEventListener('click', () => handleUserDelete(u.id));
+        }
+
+        return row;
+     }
+
+     function openUsersModal() {
+        if (!usersModal) return;
+        renderUsersEditor();
+        usersModal.style.display = 'flex';
+     }
+
+     function addNewUserEditorRow() {
+         if (!usersListEditor) return;
+         usersListEditor.prepend(createUserEditorRow(null));
+     }
+
+     async function handleUserSave(rowEl) {
+         const id = rowEl.dataset.id.startsWith('new_') ? null : rowEl.dataset.id;
+         const viewDepts = Array.from(rowEl.querySelectorAll('.perm-view-dept:checked')).map(el => el.value);
+         const viewUsers = Array.from(rowEl.querySelectorAll('.perm-view-user:checked')).map(el => el.value);
+
+         const user = {
+            id: id,
+            username: rowEl.querySelector('.user-username').value.trim(),
+            displayName: rowEl.querySelector('.user-displayName').value.trim(),
+            password: rowEl.querySelector('.user-password').value, // ارسال خالی اگر تغییری نکرده
+            role: rowEl.querySelector('.user-role').value,
+            departmentId: rowEl.querySelector('.user-departmentId').value || null,
+            permissions: {
+                view_all_depts: rowEl.querySelector('.perm-view-all-depts').checked,
+                view_depts: viewDepts,
+                view_all_users: rowEl.querySelector('.perm-view-all-users').checked,
+                view_users: viewUsers
+            }
+         };
+
+        if (!user.username || !user.displayName) {
+             alert('نام کاربری و نام نمایشی الزامی است.');
+             return;
+        }
+        if (!id && !user.password) {
+            alert('رمز عبور برای کاربر جدید الزامی است.');
+            return;
+        }
+
+        const result = await apiCall('manageUsers', { sub_action: 'save', user: user }, 'POST');
+        if (result) {
+            alert(result.message);
+            fullData.users = result.data || []; // آپدیت لیست کاربران
+            renderUsersEditor(); // بازрисов لیست
+            // اگر کاربر فعلی ویرایش شده بود، صفحه را ریلود کن
+            if (user.id === CURRENT_USER.id) {
+                alert('اطلاعات شما تغییر کرد. صفحه مجدداً بارگذاری می‌شود.');
+                window.location.reload();
+            }
+        }
+     }
+
+     async function handleUserDelete(userId) {
+        if (userId === CURRENT_USER.id) {
+            alert('شما نمی‌توانید حساب کاربری خود را حذف کنید.');
+            return;
+        }
+        if (!confirm('آیا از حذف این کاربر مطمئن هستید؟')) return;
+
+        const result = await apiCall('manageUsers', { sub_action: 'delete', user: { id: userId } }, 'POST');
+         if (result) {
+            alert(result.message);
+            fullData.users = result.data || []; // آپدیت لیست کاربران
+            renderUsersEditor(); // بازрисов لیست
+        }
+     }
+
+
+    // ===================================================================
+    // 8. ISSUE REPORTING MODALS (*** توابع خالی پیاده‌سازی شدند ***)
+    // ===================================================================
+    async function handleIssueSend() {
+        const text = issueTextInput.value.trim();
+        if (!text) {
+            alert('متن پیام نمی‌تواند خالی باشد.');
+            return;
+        }
+        const result = await apiCall('reportIssue', { text: text }, 'POST');
+        if (result) {
+            alert(result.message);
+            issueTextInput.value = '';
+            issueModal.style.display = 'none';
+        }
+    }
+
+    async function openViewIssuesModal() {
+        const result = await apiCall('getIssues', null, 'GET');
+        if (result && result.data) {
+            issuesListContainer.innerHTML = '';
+            if (result.data.length === 0) {
+                issuesListContainer.innerHTML = '<p>هیچ پیامی ثبت نشده است.</p>';
+            } else {
+                result.data.forEach(issue => {
+                     const issueDiv = document.createElement('div');
+                     issueDiv.className = 'issue-item';
+                     const timestamp = new Date(issue.timestamp).toLocaleString('fa-IR');
+                     issueDiv.innerHTML = `
+                        <p>${issue.text.replace(/\n/g, '<br>')}</p>
+                        <div class="issue-meta">
+                            <span>توسط: ${issue.userName || 'ناشناس'} (ID: ${issue.userId})</span> |
+                            <span>${toPersian(timestamp)}</span>
+                        </div>
+                     `;
+                     issuesListContainer.appendChild(issueDiv);
+                });
+            }
+            viewIssuesModal.style.display = 'flex';
+        }
+    }
+
+    // ===================================================================
+    // 9. FAB Menu Logic (*** اصلاح شد ***)
+    // ===================================================================
+     function setupFabMenu() {
+        // (*** اصلاح‌شده ***) بررسی وجود المان‌های ضروری
+        if (!fabMenu || !fabMainBtn ) {
+             console.error("FAB menu elements not found.");
+             return;
+        }
+        fabMenu.innerHTML = ''; // پاک کردن منوی قبلی
+
+        const role = CURRENT_USER.role;
+        let actions = [];
+
+        // تعریف اکشن‌ها - فقط آنهایی که مودالشان قطعا وجود دارد
+        const addAction = eventModal ? { id: 'fab-add', class: 'action-add', title: 'افزودن/پیشنهاد رویداد', icon: '+', modal: eventModal } : null;
+        const deptsAction = deptsModal ? { id: 'fab-depts', class: 'action-admin', title: 'مدیریت دپارتمان‌ها', icon: '🏛️', fn: openDeptsModal } : null;
+        const usersAction = usersModal ? { id: 'fab-users', class: 'action-admin', title: 'مدیریت کاربران', icon: '👥', fn: openUsersModal } : null;
+        const viewIssuesAction = viewIssuesModal ? { id: 'fab-view-issues', class: 'action-view-issue', title: 'مشاهده مشکلات', icon: '🐞', fn: openViewIssuesModal } : null;
+        const reportIssueAction = issueModal ? { id: 'fab-report-issue', class: 'action-issue', title: 'گزارش مشکل', icon: '⚠️', modal: issueModal } : null;
+
+
+        // اضافه کردن اکشن‌ها بر اساس نقش
+        if (role === 'manager') {
+            if(addAction) actions.push(addAction);
+            if(deptsAction) actions.push(deptsAction);
+            if(usersAction) actions.push(usersAction);
+            if(viewIssuesAction) actions.push(viewIssuesAction);
+            if(reportIssueAction) actions.push(reportIssueAction);
+        } else if (role === 'evaluator') {
+            if(addAction) actions.push(addAction);
+            if(reportIssueAction) actions.push(reportIssueAction);
+        } else if (role === 'proposer') {
+            if(addAction) actions.push(addAction);
+            if(reportIssueAction) actions.push(reportIssueAction);
+        } else { // viewer
+            if(reportIssueAction) actions.push(reportIssueAction);
+        }
+
+        // ساخت دکمه‌ها
+        actions.forEach(action => {
+             if (!action) return; // اگر اکشن null بود (چون مودالش نبود)، رد شو
+            const btn = document.createElement('button');
+            btn.id = action.id;
+            btn.className = `fab fab-action ${action.class}`;
+            btn.title = action.title;
+            btn.innerHTML = `<span>${action.icon}</span>`;
+
+            btn.addEventListener('click', (e) => {
+                 e.stopPropagation(); // جلوگیری از بسته شدن فوری منو
+                if (action.modal) {
+                    if(action.id === 'fab-add') openEventModal(null);
+                    else if (action.modal) action.modal.style.display = 'flex'; // بررسی مجدد وجود مودال
+                } else if (action.fn) {
+                    action.fn();
+                }
+                // بستن منو بعد از کلیک
+                fabMainBtn.classList.remove('active');
+                fabMenu.classList.remove('active');
+            });
+            fabMenu.appendChild(btn);
+        });
+     }
+
+    // ===================================================================
+    // 10. CURRENT TIME INDICATOR (*** اصلاح‌شده برای موبایل ***)
+    // ===================================================================
+    function createOrUpdateTimeIndicator() {
+        // حذف نشانگرهای قبلی
+        document.querySelectorAll('.time-indicator').forEach(el => el.remove());
+
+        const now = new Date(CURRENT_SERVER_TIME_ISO);
+        if (isNaN(now)) {
+             console.error("Invalid server time, cannot create time indicator.");
+             return;
+        }
+
+        const tehranParts = getTehranParts(now);
+        const todayIndex = tehranParts.dayIndex;
+
+        const weekStartMS = currentWeekStartDate.getTime();
+        const weekEndMS = weekStartMS + 7 * (1000 * 60 * 60 * 24);
+
+        if (now.getTime() >= weekStartMS && now.getTime() < weekEndMS) {
+
+            const minutesIntoDay = tehranParts.hour * 60 + tehranParts.minute;
+            const percentageOfDay = (minutesIntoDay / (24 * 60)) * 100;
+
+            const isMobile = document.body.classList.contains('mobile-view');
+
+            if (isMobile) {
+                 // (*** اصلاح‌شده ***) اضافه کردن به کانتینر روزها
+                 const daysContainer = document.querySelector('.mobile-days-container');
+                 if (daysContainer) {
+                      const indicator = document.createElement('div');
+                      indicator.className = 'time-indicator mobile';
+                      indicator.style.top = `${percentageOfDay}%`;
+                      // موقعیت افقی توسط updateMobileIndicatorPosition تنظیم می‌شود
+                      daysContainer.appendChild(indicator); // اضافه به کانتینر اسکرول‌خورنده
+                      updateMobileIndicatorPosition(indicator, now, todayIndex);
+                 }
+            } else {
+                 const dayRow = document.querySelector(`.day-row[data-day-index="${todayIndex}"] .timeline-cell`);
+                 if (dayRow) {
+                     const indicator = document.createElement('div');
+                     indicator.className = 'time-indicator desktop';
+                     indicator.style.right = `${percentageOfDay}%`;
+                     dayRow.appendChild(indicator);
+                 }
+            }
+        }
+    }
+
+     // (*** بازنویسی کامل ***) آپدیت موقعیت افقی نشانگر موبایل نسبت به کانتینر
+     function updateMobileIndicatorPosition(indicator, now, tehranDayIndex) {
+         if (!indicator || !document.body.classList.contains('mobile-view')) return;
+
+         const daysContainer = indicator.parentElement; // کانتینر والد (.mobile-days-container)
+         if (!daysContainer) return;
+
+         const todayIndex = tehranDayIndex;
+         const dayColumn = daysContainer.querySelector(`.day-column[data-day-index="${todayIndex}"]`);
+
+         if (dayColumn) {
+             const dayWidth = dayColumn.offsetWidth;
+             const scrollLeft = daysContainer.scrollLeft;
+             // موقعیت left = (ایندکس روز * عرض روز) - میزان اسکرول
+             indicator.style.left = `${(todayIndex * dayWidth) - scrollLeft}px`;
+             indicator.style.width = `${dayWidth}px`;
+         } else {
+              // اگر ستون روز پیدا نشد (بعید)، پنهان کن
+              indicator.style.left = '-9999px';
+              indicator.style.width = '0';
+         }
+     }
+
+
+    function updateTimeIndicator() {
+        let now;
+        try {
+             // (*** اصلاح‌شده ***) تخمین زمان فعلی سرور
+             const serverBase = new Date(CURRENT_SERVER_TIME_ISO);
+             const clientNow = new Date();
+             // در حالت ایده‌آل، باید زمان واکشی اولیه را ذخیره کنیم، اما این تخمین قابل قبول است
+             const elapsed = clientNow.getTime() - new Date().getTime(); // این باید نزدیک صفر باشد
+             now = new Date(serverBase.getTime() + elapsed);
+             if (isNaN(now)) throw new Error("Invalid date calculation");
+        } catch(e) {
+             console.error("Error estimating current server time:", e);
+             now = new Date(); // Fallback به زمان کلاینت
+        }
+
+        const tehranParts = getTehranParts(now);
+        const minutesIntoDay = tehranParts.hour * 60 + tehranParts.minute;
+        const percentageOfDay = (minutesIntoDay / (24 * 60)) * 100;
+        const todayIndex = tehranParts.dayIndex;
+
+
+        const desktopIndicator = document.querySelector('.time-indicator.desktop');
+        if (desktopIndicator) {
+             const currentIndicatorDayEl = desktopIndicator.closest('.day-row');
+             if (currentIndicatorDayEl?.dataset.dayIndex != todayIndex) {
+                 createOrUpdateTimeIndicator(); // روز عوض شده، دوباره بساز
+             } else {
+                desktopIndicator.style.right = `${percentageOfDay}%`;
+             }
+        }
+
+        const mobileIndicator = document.querySelector('.time-indicator.mobile');
+        if (mobileIndicator) {
+             mobileIndicator.style.top = `${percentageOfDay}%`;
+             // (*** اصلاح‌شده ***) چک کردن تغییر روز
+             const currentIndicatorDay = mobileIndicator.style.left !== '-9999px'
+                ? Math.round((parseInt(mobileIndicator.style.left) + document.querySelector('.mobile-days-container').scrollLeft) / (mobileIndicator.offsetWidth || 1))
+                : -1;
+
+             if(currentIndicatorDay != todayIndex && mobileIndicator.offsetWidth > 0){ // اگر روز عوض شده بود
+                createOrUpdateTimeIndicator(); // دوباره بساز
+             } else {
+                updateMobileIndicatorPosition(mobileIndicator, now, todayIndex);
+             }
+        } else if (document.body.classList.contains('mobile-view')){
+            // اگر در نمای موبایل بودیم ولی نشانگر نبود (مثلا روز عوض شده بود)
+             createOrUpdateTimeIndicator();
+        }
+    }
+
+
+    function startTimeIndicator() {
+        if (timeIndicatorInterval) clearInterval(timeIndicatorInterval);
+        createOrUpdateTimeIndicator(); // ایجاد اولیه
+        timeIndicatorInterval = setInterval(updateTimeIndicator, 60000);
+        // آپدیت هر دقیقه
+    }
+
+    // ===================================================================
+    // 11. (*** جدید ***) Mobile Gesture Handlers
+    // ===================================================================
+    function handleGestureStart(e) {
+        // (فقط در نمای موبایل)
+        const isMobile = document.body.classList.contains('mobile-view');
+        if (!isMobile) return;
+
+        // اگر روی رویداد یا دکمه بود، جسچر را اجرا نکن
+        if (e.target.closest('.event, .event-allday, button, a')) {
+            return;
+        }
+
+        const touches = e.touches;
+        if (touches.length === 2) { // Pinch
+            // e.preventDefault(); // (*** اصلاح‌شده ***) اجازه اسکرول در حین شروع pinch
+            gestureState.active = true;
+            gestureState.isSwipe = false;
+
+            const dx = touches[0].clientX - touches[1].clientX;
+            const dy = touches[0].clientY - touches[1].clientY;
+
+            // تشخیص نوع جسچر (افقی یا عمودی)
+            if (Math.abs(dx) > Math.abs(dy) * 1.5) { // آستانه افقی
+                gestureState.type = 'horizontal';
+                gestureState.lastDist = Math.abs(dx);
+            } else if (Math.abs(dy) > Math.abs(dx) * 1.5) { // آستانه عمودی
+                gestureState.type = 'vertical';
+                gestureState.lastDist = Math.abs(dy);
+            } else {
+                gestureState.type = null; // ناحیه مرده
+            }
+        } else if (touches.length === 1) { // Swipe
+            gestureState.isSwipe = true;
+            gestureState.swipeStartX = touches[0].clientX;
+            gestureState.swipeStartY = touches[0].clientY; // برای جلوگیری از اسکرول عمودی
+        }
+    }
+
+    function handleGestureMove(e) {
+        // اگر جسچر pinch فعال است، جلوی اسکرول را بگیر
+        if (gestureState.active && gestureState.type && e.touches.length === 2) {
+            e.preventDefault();
+        } else {
+             // اگر جسچر فعال نیست یا فقط یک انگشت است، اجازه اسکرول بده
+            return;
+        }
+
+        const touches = e.touches;
+
+        if (gestureState.type === 'horizontal') {
+            const dist = Math.abs(touches[0].clientX - touches[1].clientX);
+            const delta = dist - gestureState.lastDist;
+
+            if (Math.abs(delta) > 20) { // آستانه تغییر
+                if (delta > 0) { // Zoom In (کم کردن تعداد روزها)
+                    if (mobileViewConfig.dayCount === 7) mobileViewConfig.dayCount = 4;
+                    else if (mobileViewConfig.dayCount === 4) mobileViewConfig.dayCount = 3;
+                    else if (mobileViewConfig.dayCount === 3) mobileViewConfig.dayCount = 2;
+                    else if (mobileViewConfig.dayCount === 2) mobileViewConfig.dayCount = 1;
+                } else { // Zoom Out (زیاد کردن تعداد روزها)
+                    if (mobileViewConfig.dayCount === 1) mobileViewConfig.dayCount = 2;
+                    else if (mobileViewConfig.dayCount === 2) mobileViewConfig.dayCount = 3;
+                    else if (mobileViewConfig.dayCount === 3) mobileViewConfig.dayCount = 4;
+                    else if (mobileViewConfig.dayCount === 4) mobileViewConfig.dayCount = 7;
+                }
+                gestureState.lastDist = dist;
+                updateMobileViewCSS();
+            }
+        }
+        else if (gestureState.type === 'vertical') {
+             const dist = Math.abs(touches[0].clientY - touches[1].clientY);
+             const delta = dist - gestureState.lastDist;
+
+             if (Math.abs(delta) > 20) { // آستانه تغییر
+                 if (delta > 0) { // Zoom In (بزرگ کردن ساعت‌ها)
+                     if (mobileViewConfig.hourZoom === 1) mobileViewConfig.hourZoom = 2;
+                     else if (mobileViewConfig.hourZoom === 2) mobileViewConfig.hourZoom = 3;
+                     else if (mobileViewConfig.hourZoom === 3) mobileViewConfig.hourZoom = 4; // (*** اصلاح‌شده ***)
+                 } else { // Zoom Out (کوچک کردن ساعت‌ها)
+                     if (mobileViewConfig.hourZoom === 4) mobileViewConfig.hourZoom = 3; // (*** اصلاح‌شده ***)
+                     else if (mobileViewConfig.hourZoom === 3) mobileViewConfig.hourZoom = 2;
+                     else if (mobileViewConfig.hourZoom === 2) mobileViewConfig.hourZoom = 1;
+                 }
+                 gestureState.lastDist = dist;
+                 updateMobileViewCSS();
+             }
+        }
+    }
+
+    function handleGestureEnd(e) {
+         if (gestureState.active) {
+            gestureState.active = false;
+            gestureState.type = null;
+            gestureState.lastDist = 0;
+         }
+
+         if (gestureState.isSwipe && e.changedTouches.length === 1) {
+             const touch = e.changedTouches[0];
+             const dx = touch.clientX - gestureState.swipeStartX;
+             const dy = touch.clientY - gestureState.swipeStartY;
+
+             // فقط اگر کشیدن افقی بود و عمودی نبود
+             if (Math.abs(dx) > gestureState.swipeMinDist && Math.abs(dy) < (gestureState.swipeMinDist / 1.5)) {
+                 handleMobileSwipe(dx > 0 ? 'right' : 'left');
+             }
+             gestureState.isSwipe = false;
+         }
+    }
+
+    // (*** جدید ***) ناوبری هفته با کشیدن در موبایل
+    function handleMobileSwipe(direction) {
+        const container = document.querySelector('.mobile-days-container');
+        if (!container) return;
+
+        const scrollLeft = container.scrollLeft;
+        const scrollWidth = container.scrollWidth;
+        const clientWidth = container.clientWidth;
+
+        const threshold = 10; // آستانه خطا
+
+        if (direction === 'right' && scrollLeft <= threshold) {
+            // کشیدن به راست در ابتدای هفته -> هفته قبل
+            console.log("Swipe Right -> Prev Week");
+            navigateWeek(-7);
+        } else if (direction === 'left' && (scrollLeft + clientWidth) >= (scrollWidth - threshold)) {
+            // کشیدن به چپ در انتهای هفته -> هفته بعد
+            console.log("Swipe Left -> Next Week");
+            navigateWeek(7);
+        }
+    }
+
+
+    // ===================================================================
+    // 12. EVENT LISTENERS (*** اصلاح‌شده ***)
+    // ===================================================================
+    function setupEventListeners() {
+
+        // --- Main Calendar Click ---
+        if (calendarGridContainer) {
+            calendarGridContainer.addEventListener('click', (e) => {
+                const eventDiv = e.target.closest('.event, .event-allday');
+
+
+                 if (!eventDiv) return;
+                const isLocked = eventDiv.dataset.locked === 'true';
+                // (*** اصلاح‌شده ***) اگر قفل بود، مودال را باز نکن
+                if (isLocked) {
+
+                     // console.log("Event is locked for editing.");
+
+                    return;
+                }
+                const event = JSON.parse(eventDiv.dataset.event);
+                if (String(event.id).startsWith('h-')) return;
+
+                openEventModal(event); // فقط اگر قفل نباشد باز می‌شود
+
+            });
+        }
+
+        // --- (*** اصلاح‌شده ***) کلیک روی عنوان برای باز کردن تنظیمات هفته ---
+        if (calendarTitle) {
+            calendarTitle.addEventListener('click', () => {
+                if (CURRENT_USER.role === 'manager' && settingsModal) {
+                    openSettingsModal();
+                }
+            });
+            if (CURRENT_USER.role === 'manager') {
+                 calendarTitle.style.cursor = 'pointer';
+            }
+        }
+
+        // --- Week Navigation ---
+        if (prevWeekBtn) prevWeekBtn.addEventListener('click', () => navigateWeek(-7));
+        if (nextWeekBtn) nextWeekBtn.addEventListener('click', () => navigateWeek(7));
+
+        async function navigateWeek(days) {
+            stopPolling();
+            currentWeekStartDate.setDate(currentWeekStartDate.getDate() + days);
+            // (*** اصلاح‌شده ***) فراخوانی تابع سراسری
+            await fetchAndRenderCurrentWeekData();
+            // واکشی و رندر هفته جدید
+            startPolling();
+        }
+
+        // --- FAB Menu Toggle ---
+        if (fabMainBtn) {
+            fabMainBtn.addEventListener('click', (e) => {
+                 e.stopPropagation(); // (*** جدید ***) جلوگیری از بسته شدن توسط document
+                 // (*** اصلاح‌شده ***) چک کردن آیا المان fabMenu وجود دارد
+                 if(fabMenu) {
+                     fabMainBtn.classList.toggle('active');
+                     fabMenu.classList.toggle('active');
+                 } else {
+                      console.error("FAB menu element not found!");
+                 }
+            });
+        }
+         // (*** جدید ***) بستن منوی FAB با کلیک بیرون از آن
+         document.addEventListener('click', (e) => {
+              if (fabMainBtn && fabMenu && fabContainer && fabMainBtn.classList.contains('active')) { // (*** اصلاح‌شده ***) چک کردن fabContainer
+                   if (!fabContainer.contains(e.target)) {
+                        fabMainBtn.classList.remove('active');
+                        fabMenu.classList.remove('active');
+                   }
+              }
+         });
+
+
+        // --- View Toggle Button ---
+        if (viewToggleBtn) { viewToggleBtn.addEventListener('click', () => { currentView = (currentView === 'grid' ? 'list' : 'grid'); viewToggleBtn.textContent = (currentView === 'grid' ? 'نمای لیستی' : 'نمای جدولی'); renderCurrentView(); });
+        }
+
+        // --- Event Modal ---
+        if (eventModal) {
+            isAllDayCheckbox.addEventListener('change', () => {
+                const isChecked = isAllDayCheckbox.checked;
+                startTimeInput.disabled = isChecked; endTimeInput.disabled = isChecked;
+                if(isChecked) {
+                    startTimeInput.value = "00:00";
+                    endTimeInput.value = "24:00";
+                    endDaySelect.value = startDaySelect.value;
+                }
+            });
+            cancelEventBtn?.addEventListener('click', closeEventModal);
+            eventForm?.addEventListener('submit', handleEventFormSubmit);
+            approveEventBtn?.addEventListener('click', () => handleEventStatusUpdate('approved'));
+            rejectEventBtn?.addEventListener('click', () => handleEventStatusUpdate('rejected'));
+            deleteEventBtn?.addEventListener('click', handleEventDelete);
+        }
+
+        // --- Color Legend ---
+        if (legendBtn) { legendBtn.addEventListener('click', (e) => { e.stopPropagation(); if(legendPopup) legendPopup.style.display = legendPopup.style.display === 'block' ? 'none' : 'block'; });
+        }
+        document.addEventListener('click', (e) => { if (legendPopup && !legendPopup.contains(e.target) && e.target !== legendBtn) { legendPopup.style.display = 'none'; } });
+        // --- Manager Modals Listeners ---
+        const saveSettingsBtn = document.getElementById('save-settings-btn');
+        if (saveSettingsBtn) { saveSettingsBtn.addEventListener('click', handleSettingsSave); document.getElementById('cancel-settings-btn')?.addEventListener('click', () => {if(settingsModal) settingsModal.style.display = 'none'});
+        }
+        const saveDeptsBtn = document.getElementById('save-depts-btn');
+        if (saveDeptsBtn) { saveDeptsBtn.addEventListener('click', handleDeptsSave); document.getElementById('add-new-dept-btn')?.addEventListener('click', addNewDeptEditorRow);
+        document.getElementById('cancel-depts-btn')?.addEventListener('click', () => {if(deptsModal) deptsModal.style.display = 'none'}); }
+        const addNewUserBtn = document.getElementById('add-new-user-btn');
+        if (addNewUserBtn) { addNewUserBtn.addEventListener('click', addNewUserEditorRow); document.getElementById('cancel-users-btn')?.addEventListener('click', () => {if(usersModal) usersModal.style.display = 'none'});
+        }
+
+        // --- Issue Modals Listeners ---
+        const cancelIssueBtn = document.getElementById('cancel-issue-btn');
+        if (cancelIssueBtn) { cancelIssueBtn.addEventListener('click', () => { if(issueModal) issueModal.style.display = 'none'; });
+        }
+        const sendIssueBtn = document.getElementById('send-issue-btn');
+        if (sendIssueBtn) { sendIssueBtn.addEventListener('click', handleIssueSend);
+        }
+        if(viewIssuesModal) { const closeIssuesBtn = document.getElementById('close-issues-btn');
+        if (closeIssuesBtn) { closeIssuesBtn.addEventListener('click', () => { viewIssuesModal.style.display = 'none'; });
+        } }
+
+        // --- Resize & Scroll ---
+        let resizeTimer;
+        window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { renderGridView(); startTimeIndicator(); }, 100); });
+
+        // (*** اصلاح‌شده ***) شنود رویدادها در کانتینر گرید (برای پشتیبانی از گرید موبایل)
+        if (calendarGridContainer) {
+             // آپدیت موقعیت افقی نشانگر موبایل هنگام اسکرول
+             calendarGridContainer.addEventListener('scroll', (e) => {
+                 // فقط اگر اسکرول در کانتینر روزها اتفاق افتاد
+                 if (e.target.classList.contains('mobile-days-container')) {
+                     const mobileIndicator = document.querySelector('.time-indicator.mobile');
+                     if (mobileIndicator) {
+                         const now = new Date(); // زمان فعلی برای پیدا کردن روز
+                         try {
+                             // تخمین زمان سرور
+                             const serverBase = new Date(CURRENT_SERVER_TIME_ISO);
+                             // نیاز به ذخیره زمان اولیه واکشی داریم، فعلا از تخمین ساده استفاده می‌کنیم
+                             const clientFetchTime = clientBaseTime || new Date(); // clientBaseTime باید در جای دیگر ست شود
+                             const elapsed = new Date().getTime() - clientFetchTime.getTime();
+                             now.setTime(serverBase.getTime() + elapsed);
+
+                         } catch(e){}
+
+                         const tehranParts = getTehranParts(now);
+                         updateMobileIndicatorPosition(mobileIndicator, now, tehranParts.dayIndex);
+                     }
+                 }
+             }, { passive: true });
+
+             // (*** اصلاح‌شده ***) شنود جسچرهای موبایل با passive: false برای touchstart
+             calendarGridContainer.addEventListener('touchstart', handleGestureStart, { passive: false });
+             calendarGridContainer.addEventListener('touchmove', handleGestureMove, { passive: false }); // active gesture must block scroll
+             calendarGridContainer.addEventListener('touchend', handleGestureEnd);
+             calendarGridContainer.addEventListener('touchcancel', handleGestureEnd);
+        }
+    }
+
+    // --- Initial Load ---
+    let clientBaseTime = new Date(); // (*** جدید ***) زمان اولیه کلاینت برای تخمین در updateTimeIndicator
+    setupEventListeners();
+    setupFabMenu();
+    loadAndRender(); // Start the app (polling starts inside this after successful load)
+});
+
+index.php
+
+<?php
+session_start();
+// اگر کاربر لاگین نکرده، به صفحه ورود برود
+if (!isset($_SESSION['user_id'])) {
+  header('Location: login.php');
+  exit;
+}
+
+$user_role = $_SESSION['role'] ?? 'viewer';
+
+// داده‌های سشن را به جاوااسکریپت تزریق می‌کنیم
+$user_data_json = json_encode([
+  'id' => $_SESSION['user_id'],
+  'username' => $_SESSION['username'],
+  'displayName' => $_SESSION['displayName'],
+  'role' => $user_role,
+  'departmentId' => $_SESSION['departmentId'],
+  'permissions' => $_SESSION['permissions']
+]);
+// دریافت زمان فعلی سرور بر اساس تهران
+date_default_timezone_set('Asia/Tehran');
+$current_server_time = date('c');
+$tehran_offset = date('P');
+
+?>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+
+<head>
+  <meta charset="UTF-8">
+  <title>داشبورد تقویم</title>
+  <link rel="stylesheet" href="style.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body class="display-page">
+
+  <script>
+    const CURRENT_USER = <?php echo $user_data_json; ?>;
+    const CURRENT_SERVER_TIME_ISO = "<?php echo $current_server_time; ?>";
+    const TEHRAN_TIMEZONE_OFFSET = "<?php echo $tehran_offset; ?>";
+  </script>
+
+  <div id="loader-overlay" class="hidden">
+    <div class="spinner"></div>
+  </div>
+
+  <div class="page-container">
+    <header class="main-header">
+      <div class="header-controls left-controls">
+        <div id="color-legend-container">
+          <button id="color-legend-btn">راهنمای رنگ</button>
+          <div id="color-legend-popup"></div>
+        </div>
+        <?php if ($user_role === 'evaluator' || $user_role === 'manager'): ?>
+          <button id="view-toggle-btn" class="small-btn secondary-btn">نمای لیستی</button>
+        <?php endif; ?>
+      </div>
+
+      <div class="week-navigator">
+        <button id="next-week-btn" class="week-nav-btn" title="هفته بعد">
+          <svg viewBox="0 0 24 24">
+            <path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+          </svg>
+        </button>
+        <h1 id="calendar-title" title="تغییر هفته"></h1>
+        <button id="prev-week-btn" class="week-nav-btn" title="هفته قبل">
+          <svg viewBox="0 0 24 24">
+            <path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z" />
+          </svg>
+        </button>
+      </div>
+
+      <div class="header-controls right-controls">
+        <span>کاربر: <?php echo htmlspecialchars($_SESSION['displayName']); ?></span>
+        <a href="logout.php" class="logout-btn">خروج</a>
+      </div>
+    </header>
+
+    <div id="calendar-grid-container"></div>
+    <div id="calendar-list-container" style="display: none;"></div>
+  </div>
+
+  <div class="fab-container">
+    <div class="fab-menu" id="fab-menu">
+    </div>
+    <button class="fab fab-main" id="fab-main-btn" title="منوی اصلی">
+      <span>+</span>
+    </button>
+  </div>
+
+
+  <div id="event-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3 id="event-modal-title">ثبت رویداد جدید</h3>
+      <form id="event-form">
+        <input type="hidden" id="eventId">
+        <div class="form-group">
+          <label for="eventTitle">عنوان</label>
+          <input type="text" id="eventTitle" required>
+        </div>
+        <div class="form-group">
+          <label for="eventBy">مجری</label>
+          <input type="text" id="eventBy">
+        </div>
+        <div class="form-group">
+          <label for="eventFor">مخاطب</label>
+          <input type="text" id="eventFor">
+        </div>
+
+        <div class="form-group" id="event-goal-group">
+          <label for="eventGoal">هدف</label>
+          <textarea id="eventGoal" rows="3"></textarea>
+        </div>
+
+        <div id="event-colors-manager" style="display: none;">
+          <div class="form-group color-picker">
+            <label>رنگ پس‌زمینه</label>
+            <input type="color" id="eventBgColor" value="#5c6bc0">
+          </div>
+          <div class="form-group color-picker">
+            <label>رنگ متن</label>
+            <input type="color" id="eventTextColor" value="#ffffff">
+          </div>
+        </div>
+
+        <div class="form-group" style="display:flex; align-items:center;">
+          <input type="checkbox" id="isAllDay" style="width:auto; margin-left: 10px;">
+          <label for="isAllDay" style="margin:0;">رویداد تمام-روز</label>
+        </div>
+
+        <div id="time-inputs" class="time-inputs-container multi-day">
+          <div class="form-group">
+            <label for="startDay">از روز:</label>
+            <select id="startDay">
+              <option value="0">شنبه</option>
+              <option value="1">یکشنبه</option>
+              <option value="2">دوشنبه</option>
+              <option value="3">سه‌شنبه</option>
+              <option value="4">چهارشنبه</option>
+              <option value="5">پنجشنبه</option>
+              <option value="6">جمعه</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="startTime">ساعت شروع:</label>
+            <input type="time" id="startTime" class="time-input" value="09:00" required>
+          </div>
+          <div class="form-group">
+            <label for="endDay">تا روز:</label>
+            <select id="endDay">
+              <option value="0">شنبه</option>
+              <option value="1">یکشنبه</option>
+              <option value="2">دوشنبه</option>
+              <option value="3">سه‌شنبه</option>
+              <option value="4">چهارشنبه</option>
+              <option value="5">پنجشنبه</option>
+              <option value="6">جمعه</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="endTime">ساعت پایان:</label>
+            <input type="time" id="endTime" class="time-input" value="10:00" required>
+          </div>
+        </div>
+
+        <div class="modal-actions" id="event-modal-actions">
+          <div id="approval-actions" style="display: none;">
+            <button type="button" id="approve-event-btn" class="secondary-btn">تایید رویداد</button>
+            <button type="button" id="reject-event-btn" class="danger-btn">رد رویداد</button>
+          </div>
+          <div>
+            <button type="button" id="delete-event-btn" class="danger-btn" style="display: none;">حذف</button>
+            <button type="submit" id="save-event-btn">ذخیره</button>
+            <button type="button" id="cancel-event-btn" class="secondary-btn">انصراف</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>تنظیمات اصلی تقویم</h3>
+      <div class="form-group">
+        <label for="mainHeader">عنوان اصلی تقویم</label>
+        <input type="text" id="mainHeader">
+      </div>
+      <div class="form-group">
+        <label for="weekSelector">انتخاب هفته (هفته انتخابی به عنوان پیش‌فرض ذخیره می‌شود)</label>
+        <select id="weekSelector"></select>
+      </div>
+      <div class="modal-actions">
+        <button id="save-settings-btn">ذخیره تنظیمات</button>
+        <button id="cancel-settings-btn" class="secondary-btn">انصراف</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="depts-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>مدیریت دپارتمان‌ها</h3>
+      <div id="depts-list-editor"></div>
+      <hr>
+      <button id="add-new-dept-btn" class="secondary-btn small-btn" style="align-self: flex-start;">افزودن دپارتمان
+        جدید</button>
+      <div class="modal-actions">
+        <button id="save-depts-btn">ذخیره دپارتمان‌ها</button>
+        <button id="cancel-depts-btn" class="secondary-btn">انصراف</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="users-modal" class="modal-overlay">
+    <div class="modal-content" style="max-width: 800px;">
+      <h3>مدیریت کاربران</h3>
+      <div id="users-list-editor"></div>
+      <hr>
+      <button id="add-new-user-btn" class="secondary-btn small-btn" style="align-self: flex-start;">افزودن کاربر
+        جدید</button>
+      <div class="modal-actions">
+        <button id="cancel-users-btn" class="secondary-btn">بستن</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="issue-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>گزارش مشکل / بازخورد</h3>
+      <form id="issue-form">
+        <div class="form-group">
+          <label for="issue-text">لطفا مشکل یا بازخورد خود را بنویسید:</label>
+          <textarea id="issue-text" rows="5" required></textarea>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="send-issue-btn">ارسال پیام</button>
+          <button type="button" id="cancel-issue-btn" class="secondary-btn">انصراف</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="view-issues-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>مشاهده مشکلات گزارش‌شده</h3>
+      <div id="issues-list-container"></div>
+      <div class="modal-actions">
+        <button id="close-issues-btn" class="secondary-btn">بستن</button>
+      </div>
+    </div>
+  </div>
+
+
+  <script src="app.js"></script>
+</body>
+
+</html>
+
+login.php
+
+<?php
+session_start();
+// اگر کاربر از قبل لاگین بود، به داشبورد برود
+if (isset($_SESSION['user_id'])) {
+    header('Location: index.php');
+    exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $username = $_POST['username'];
+    $password = $_POST['password'];
+
+    $users = json_decode(file_get_contents('./data/users.json'), true);
+    
+    $found_user = null;
+    foreach ($users as $user) {
+        if ($user['username'] === $username) {
+            $found_user = $user;
+            break;
+        }
+    }
+
+    if ($found_user && password_verify($password, $found_user['password_hash'])) {
+        // احراز هویت موفق
+        $_SESSION['user_id'] = $found_user['id'];
+        $_SESSION['username'] = $found_user['username'];
+        $_SESSION['displayName'] = $found_user['displayName']; // <-- فیلد جدید اضافه شد
+        $_SESSION['role'] = $found_user['role'];
+        $_SESSION['departmentId'] = $found_user['departmentId'];
+        $_SESSION['permissions'] = $found_user['permissions'];
+        
+        header('Location: index.php');
+        exit;
+    } else {
+        // احراز هویت ناموفق
+        $error = 'نام کاربری یا رمز عبور اشتباه است.';
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>ورود به سیستم تقویم</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body class="login-page">
+    <div class="login-container">
+        <h1>ورود به تقویم</h1>
+        <p>برای ورود از اطلاعات زیر استفاده کنید:
+            <br><b>مدیر:</b> admin / password123
+            <br><b>کاربر:</b> proposer / password123
+        </p>
+        <?php if ($error): ?>
+            <div class="login-error"><?php echo $error; ?></div>
+        <?php endif; ?>
+        <form method="POST" action="login.php">
+            <div class="form-group">
+                <label for="username">نام کاربری:</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">رمز عبور:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit">ورود</button>
+        </form>
+    </div>
+</body>
+</html>
+
+logout.php
+
+<?php
+session_start();
+session_unset();
+session_destroy();
+header('Location: login.php');
+exit;
+?>
+
+style.css
+
+/* ==========================================================================
+   1. Global Styles & Variables (*** اصلاح‌شده ***)
+   ========================================================================== */
+:root {
+  --color-primary: #2c3e50; /* Navy Blue */
+  --color-secondary: #198754; /* Green */
+  --color-danger: #e53935; /* Red */
+  --color-warning: #ffb300; /* Yellow */
+  --color-info: #0dcaf0; /* Cyan */
+  --color-border: #dce0e6; /* Light Gray */
+  --color-border-soft: #eaedf0;
+  --color-text: #2c3e50; /* Dark Text */
+  --color-text-muted: #7f8c8d; /* Muted Gray */
+  --color-surface: #ffffff; /* White */
+  --color-background: #f7f8fc; /* Very Light Gray/Blue */
+  --font-family-base: 'Pinar Regular', tahoma, sans-serif; /* *** فونت پیش‌فرض *** */
+  --font-family-bold: 'Pinar Bold', tahoma, sans-serif; /* *** فونت بولد *** */
+  --font-family-light: 'Pinar Light', tahoma, sans-serif; /* *** فونت لایت *** */
+  --font-family-black: 'Pinar Black', tahoma, sans-serif; /* *** فونت بلک *** */
+  --border-radius: 8px; /* کمی گردتر */
+  --shadow-soft: 0 4px 12px rgba(0,0,0,0.08);
+  --shadow-medium: 0 6px 20px rgba(0,0,0,0.12);
+
+  /* (*** اصلاح‌شده ***) متغیر برای ارتفاع دقیق هدر موبایل */
+  --mobile-header-height: 105px; /* تنظیم دقیق‌تر ارتفاع هدر در موبایل */
+  --mobile-allday-row-height: 4rem;
+  --mobile-time-axis-corner-height: 4.5rem; /* = day-label height */
+  /* ارتفاع موجود برای تایم‌لاین = ارتفاع صفحه - ارتفاع هدر اصلی - ارتفاع ردیف all-day */
+  --mobile-timeline-available-height: calc(100vh - var(--mobile-header-height) - var(--mobile-allday-row-height));
+}
+
+/* (*** جدید ***) تعریف فونت‌ها */
+@font-face {
+  font-family: 'Pinar Black';
+  src: url('fonts/PINAR-BLACK.TTF') format('truetype');
+  font-weight: 900;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Pinar Bold';
+  src: url('fonts/PINAR-BOLD.TTF') format('truetype');
+  font-weight: bold; /* 700 */
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Pinar ExtraBold';
+  src: url('fonts/PINAR-EXTRABOLD.TTF') format('truetype');
+  font-weight: 800;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Pinar Light';
+  src: url('fonts/PINAR-LIGHT.TTF') format('truetype');
+  font-weight: 300;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Pinar Medium';
+  src: url('fonts/PINAR-MEDIUM.TTF') format('truetype');
+  font-weight: 500;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Pinar Regular';
+  src: url('fonts/PINAR-REGULAR.TTF') format('truetype');
+  font-weight: normal; /* 400 */
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Pinar SemiBold';
+  src: url('fonts/PINAR-SEMIBOLD.TTF') format('truetype');
+  font-weight: 600;
+  font-style: normal;
+}
+
+
+html, body.display-page { /* (*** اصلاح‌شده ***) */
+  height: 100vh;
+  overflow: hidden; /* جلوگیری از اسکرول کل صفحه */
+}
+
+body, input, select, button, textarea { /* (*** اصلاح‌شده ***) html حذف شد */
+  margin: 0; padding: 0; font-family: var(--font-family-base); /* *** اعمال فونت *** */
+  background: var(--color-background); color: var(--color-text);
+  -webkit-print-color-adjust: exact !important; color-adjust: exact !important;
+  box-sizing: border-box; /* (*** جدید ***) */
+}
+*, *::before, *::after { /* (*** جدید ***) */
+    box-sizing: inherit;
+}
+
+hr { border: none; border-top: 1px solid var(--color-border-soft); margin: 2.5rem 0; }
+button { cursor: pointer; }
+textarea { font-family: var(--font-family-base);
+  width: 100%; padding: 0.8rem 1rem; border: 1px solid var(--color-border); border-radius: var(--border-radius);
+}
+
+/* ==========================================================================
+   2. Login Page Styles
+   ========================================================================== */
+body.login-page {
+  display: flex; align-items: center; justify-content: center;
+  height: 100vh; background: var(--color-primary);
+  overflow: auto; /* (*** جدید ***) اجازه اسکرول در صفحه لاگین */
+}
+.login-container {
+  width: 100%; max-width: 400px; padding: 2.5rem;
+  background: var(--color-surface); border-radius: var(--border-radius);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+}
+.login-container h1 { text-align: center; margin-top: 0; color: var(--color-primary); font-family: var(--font-family-black); }
+.login-container p { font-size: 0.9rem; background: #f1f1f1; padding: 1rem; border-radius: 8px; line-height: 1.6; }
+.login-error { background: #ffebee; color: var(--color-danger);
+  padding: 1rem; border-radius: 8px; text-align: center; margin-bottom: 1rem; }
+.login-container form button {
+  width: 100%; padding: 0.9rem; font-size: 1.1rem;
+  font-family: var(--font-family-bold); color: white;
+  background: var(--color-secondary); border: none; border-radius: var(--border-radius);
+  margin-top: 1rem; transition: background 0.2s;
+}
+.login-container form button:hover { background: #146c43; }
+
+/* ==========================================================================
+   3. Form, Input, Button Styles (Global)
+   ========================================================================== */
+.form-group { margin-bottom: 1.2rem; }
+.form-group label { display: block; margin-bottom: 0.6rem; font-family: var(--font-family-bold); } /* Bold Labels */
+.form-group input[type="text"],
+.form-group input[type="password"],
+.form-group input[type="color"],
+.form-group input[type="date"], /* *** جدید *** */
+.form-group input[type="time"], /* *** جدید *** */
+.form-group select {
+  width: 100%;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--color-border); border-radius: var(--border-radius);
+  transition: all 0.2s ease-in-out; background-color: #fdfdfd;
+}
+.form-group input[type="text"]:focus,
+.form-group input[type="password"]:focus,
+.form-group input[type="date"]:focus,
+.form-group input[type="time"]:focus,
+.form-group select:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(44, 62, 80, 0.15);
+  outline: none;
+}
+.time-inputs-container { display: flex; flex-wrap: wrap; gap: 1rem; }
+/* (جدید) حالت چند روزه برای فرم */
+.time-inputs-container.multi-day .form-group { flex: 1 1 200px; }
+.time-input { text-align: center; font-family: var(--font-family-bold);
+  font-size: 1rem; /* کوچکتر شد */ } /* Removed cursor pointer */
+button, .button, a.button {
+  flex: 1; padding: 0.9rem;
+  font-size: 1rem; font-family: var(--font-family-bold); color: white;
+  border: none; border-radius: var(--border-radius); cursor: pointer; text-decoration: none;
+  text-align: center; transition: all 0.2s ease-in-out;
+  background: var(--color-primary);
+}
+button:hover { opacity: 0.85; }
+.danger-btn { background-color: var(--color-danger); }
+.secondary-btn { background-color: #6c757d; color: white; }
+.small-btn { padding: 0.5rem 0.8rem; font-size: 0.9rem; flex-grow: 0; }
+
+/* ==========================================================================
+   4. Modal (Popup) Styles
+   ========================================================================== */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.6); z-index: 1000;
+  display: none; align-items: center; justify-content: center;
+  /* (*** اصلاح‌شده ***) */
+  -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
+}
+.modal-content {
+  background: var(--color-surface); padding: 2rem; border-radius: var(--border-radius);
+  width: 90%; max-width: 600px; display: flex; flex-direction: column;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-medium);
+}
+.modal-content h3 { margin-top: 0; border-bottom: 2px solid var(--color-border); padding-bottom: 1rem; font-family: var(--font-family-black); }
+.modal-actions {
+  display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1.5rem;
+  border-top: 1px solid var(--color-border-soft); padding-top: 1.5rem;
+  justify-content: space-between;
+}
+.modal-actions > div { display: flex; gap: 1rem; }
+
+/* ==========================================================================
+   5. FAB Menu (*** اصلاح‌شده برای حالت خطی و رفع باگ ***)
+   ========================================================================== */
+.fab-container {
+  position: fixed;
+  bottom: 2rem;
+  left: 2rem; /* موقعیت پایین-چپ */
+  z-index: 900;
+  display: flex;
+  align-items: flex-end;
+}
+
+.fab-main {
+  width: 60px; height: 60px; border-radius: 50%; background: var(--color-primary); color: white; font-size: 2.5rem;
+  border: none; box-shadow: 0 4px 12px rgba(0,0,0,0.2); cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); padding: 0; display: flex;
+  align-items: center; justify-content: center; position: relative; z-index: 902;
+  order: 1; /* دکمه اصلی آخر (برای دسکتاپ) */
+}
+.fab-main span { transition: transform 0.3s; }
+.fab-main.active span { transform: rotate(45deg); }
+
+.fab-menu {
+  display: flex;
+  flex-direction: row; /* پیش‌فرض افقی (دسکتاپ) */
+  align-items: center;
+  gap: 0.75rem;
+  margin-right: 0.75rem; /* فاصله از دکمه اصلی */
+  z-index: 901;
+  transition: opacity 0.3s, transform 0.3s;
+  opacity: 0;
+  transform: translateX(-15px) scale(0.9); /* شروع کمی چپ و کوچک */
+  pointer-events: none; /* (*** جدید ***) عدم دریافت کلیک */
+}
+/* حالت فعال منو (دسکتاپ) */
+.fab-main.active + .fab-menu {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    pointer-events: auto; /* (*** جدید ***) دریافت کلیک */
+}
+
+
+.fab-action {
+  width: 50px; height: 50px; border-radius: 50%; color: white; font-size: 1.5rem; display: flex; align-items: center; justify-content: center; border: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15); cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); /* (*** اصلاح‌شده ***) سرعت انیمیشن */
+  opacity: 0;
+  transform: scale(0.7); /* (*** اصلاح‌شده ***) شروع کمی کوچک‌تر */
+}
+
+/* نمایش اکشن‌ها وقتی منو فعال است (دسکتاپ و موبایل) */
+.fab-main.active + .fab-menu .fab-action,
+.fab-main.active ~ .fab-menu .fab-action
+{
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* انیمیشن تاخیری (برای هر دو حالت یکسان است) */
+.fab-main.active + .fab-menu .fab-action:nth-child(1),
+.fab-main.active ~ .fab-menu .fab-action:nth-last-child(1) { transition-delay: 0.0s; }
+.fab-main.active + .fab-menu .fab-action:nth-child(2),
+.fab-main.active ~ .fab-menu .fab-action:nth-last-child(2) { transition-delay: 0.04s; } /* (*** اصلاح‌شده ***) */
+.fab-main.active + .fab-menu .fab-action:nth-child(3),
+.fab-main.active ~ .fab-menu .fab-action:nth-last-child(3) { transition-delay: 0.08s; } /* (*** اصلاح‌شده ***) */
+.fab-main.active + .fab-menu .fab-action:nth-child(4),
+.fab-main.active ~ .fab-menu .fab-action:nth-last-child(4) { transition-delay: 0.12s; } /* (*** اصلاح‌شده ***) */
+.fab-main.active + .fab-menu .fab-action:nth-child(5),
+.fab-main.active ~ .fab-menu .fab-action:nth-last-child(5) { transition-delay: 0.16s; } /* (*** اصلاح‌شده ***) */
+
+
+.fab-action.action-add { background: var(--color-secondary); }
+.fab-action.action-admin { background: var(--color-primary); }
+.fab-action.action-issue { background: var(--color-warning); color: #333; }
+.fab-action.action-view-issue { background: #6f42c1; } /* Purple */
+
+/* (*** اصلاح‌شده ***) استایل‌های موبایل برای FAB */
+@media (max-width: 768px) {
+  .fab-container {
+    flex-direction: column-reverse; /* دکمه اصلی پایین، منو بالا */
+    align-items: flex-start; /* چپ‌چین */
+    /* (*** اصلاح‌شده ***) موقعیت دقیق‌تر */
+    bottom: 1rem;
+    left: 1rem;
+  }
+  .fab-menu {
+    flex-direction: column; /* عمودی */
+    margin-right: 0;
+    margin-bottom: 0.75rem;
+    align-items: flex-start;
+    transform: translateY(15px) scale(0.9); /* (*** اصلاح‌شده ***) شروع کمی پایین */
+  }
+  /* حالت فعال منو (موبایل) */
+  .fab-main.active ~ .fab-menu {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      pointer-events: auto; /* (*** جدید ***) */
+  }
+
+  .fab-main {
+      width: 50px; height: 50px; font-size: 2rem;
+      order: 0; /* دکمه اصلی اول (پایین) */
+  }
+  .fab-action {
+      width: 40px; height: 40px; font-size: 1.2rem;
+      transform: scale(0.7) translateY(10px); /* (*** اصلاح‌شده ***) */
+  }
+   .fab-main.active ~ .fab-menu .fab-action {
+       transform: scale(1) translateY(0);
+   }
+}
+
+
+/* ==========================================================================
+   6. Loader Overlay
+   ========================================================================== */
+#loader-overlay { position: fixed;
+ top: 0; left: 0; width: 100%; height: 100%; background: rgba(255, 255, 255, 0.7); z-index: 9999; display: flex; align-items: center;
+ justify-content: center; transition: opacity 0.3s; }
+#loader-overlay.hidden { opacity: 0; pointer-events: none; }
+.spinner { width: 50px; height: 50px;
+ border: 5px solid var(--color-border); border-top-color: var(--color-primary); border-radius: 50%; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg);
+ } }
+
+/* ==========================================================================
+   7. Display Page - Header (*** اصلاح‌شده برای ارتفاع 100% ***)
+   ========================================================================== */
+.page-container {
+    display: flex; flex-direction: column; width: 100%; height: 100vh; /* ارتفاع ثابت */
+    overflow: hidden; /* جلوگیری از اسکرول کانتینر اصلی */
+}
+.main-header {
+  padding: 0.5rem 1.5rem;
+  background-color: var(--color-surface);
+  border-bottom: 2px solid var(--color-border);
+  flex-shrink: 0; /* هدر کوچک نشود */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: relative;
+  z-index: 800;
+  height: 61px; /* (*** جدید ***) ارتفاع ثابت برای هدر */
+  box-sizing: border-box;
+}
+.header-controls { display: flex; align-items: center;
+  gap: 1rem; flex-basis: 300px; }
+.header-controls.left-controls { justify-content: flex-start;
+ }
+.header-controls.right-controls { justify-content: flex-end; }
+.logout-btn { font-size: 0.9rem; padding: 0.4rem 0.8rem;
+  background: var(--color-danger); color: white; border-radius: 6px; text-decoration: none;
+ }
+#view-toggle-btn { padding: 0.4rem 0.8rem; font-size: 0.9rem; }
+
+/* (*** Week Navigator اصلاح‌شده ***) */
+.week-navigator { display: flex; align-items: center;
+ justify-content: center; gap: 0.5rem; flex-grow: 1; }
+.week-navigator h1 { margin: 0; font-family: var(--font-family-black); font-size: 1.2rem; color: var(--color-primary); text-align: center;
+ cursor: pointer;
+  padding: 0.5rem; border-radius: 4px; transition: background-color 0.2s;
+  min-width: 320px; /* عرض ثابت برای جلوگیری از پرش */
+}
+.week-navigator h1:hover { background-color: var(--color-border-soft);
+ }
+/* (*** استایل دکمه‌های هفته قبل/بعد ***) */
+.week-nav-btn {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  color: var(--color-primary);
+  width: 36px; height: 36px;
+  border-radius: var(--border-radius);
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  transition: all 0.2s ease-in-out;
+  padding: 0.25rem;
+  box-sizing: border-box;
+}
+.week-nav-btn:hover { background: var(--color-background); box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+ border-color: #cdd3db; }
+.week-nav-btn:active { transform: translateY(1px); box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+.week-nav-btn svg {
+  width: 24px; height: 24px;
+  fill: currentColor;
+ }
+
+
+/* ==========================================================================
+   8. Display Page - Grid (*** اصلاح‌شده برای ارتفاع 100% و sticky ***)
+   ========================================================================== */
+#calendar-grid-container {
+  flex-grow: 1; /* گرفتن فضای باقیمانده */
+  overflow: hidden; /* جلوگیری از اسکرول این کانتینر */
+  position: relative;
+  /* height محاسبه نمی‌شود، توسط flex گرفته می‌شود */
+}
+#calendar-list-container { flex-grow: 1; overflow-y: auto; padding: 1rem;
+ }
+.calendar-grid { display: flex; flex-direction: column; height: 100%; } /* ارتفاع کامل والد */
+.grid-header {
+  display: grid;
+  grid-template-columns: 4rem 6rem 1fr;
+  flex-shrink: 0;
+  background-color: var(--color-surface);
+  position: sticky; /* چسبیدن به بالای #calendar-grid-container */
+  top: 0;
+  z-index: 20;
+}
+.header-corner, .header-allday, .header-timeline { display: flex; align-items: center; justify-content: center;
+  border-bottom: 2px solid var(--color-border); border-left: 2px solid var(--color-border);
+  box-sizing: border-box; /* (*** جدید ***) */
+}
+.header-timeline { border-left: none; }
+.header-allday { font-family: var(--font-family-bold); }
+.header-timeline { display: grid;
+  grid-template-columns: repeat(48, 1fr); height: 3rem;
+}
+.time-label { text-align: center; font-size: 0.9rem; color: var(--color-text-muted); border-right: 1px solid var(--color-border-soft); padding-top: 1rem;
+  writing-mode: vertical-rl; transform: rotate(180deg); display: flex;
+  align-items: end; box-sizing: border-box; /* (*** جدید ***) */
+}
+.time-label:nth-child(2n) { border-right: 1px solid var(--color-border); font-weight: bold; color: var(--color-text);
+ }
+
+/* (*** اصلاح‌شده ***) بدنه گرید با اسکرول داخلی */
+.grid-body {
+  flex-grow: 1; /* گرفتن فضای باقیمانده */
+  overflow: auto; /* (*** اصلاح‌شده ***) فعال کردن اسکرول افقی و عمودی */
+  position: relative;
+  /* height محاسبه نمی‌شود، توسط flex گرفته می‌شود */
+}
+.day-row { display: grid;
+  grid-template-columns: 4rem 6rem 1fr;
+  /* ارتفاع ردیف دیگر ثابت نیست */
+  min-height: 120px; /* حداقل ارتفاع */
+  position: relative; /* برای sticky children */
+ }
+.day-label, .all-day-cell, .timeline-cell {
+    border-bottom: 1px solid var(--color-border);
+    box-sizing: border-box; /* (*** جدید ***) */
+}
+.day-label { display: flex; flex-direction: column; align-items: center; justify-content: center;
+  border-left: 2px solid var(--color-border); background-color: var(--color-surface); /* (*** اصلاح‌شده ***) */
+  font-family: var(--font-family-bold); font-size: 1.1rem; text-align: center;
+  position: sticky; /* ثابت ماندن لیبل روز */
+  left: 0;
+  z-index: 5;
+}
+.day-label .date { font-family: var(--font-family-light); font-size: 0.8rem;
+ color: var(--color-text-muted); }
+.all-day-cell { border-left: 2px solid var(--color-border); padding: 2px;
+  display: grid; grid-template-rows: repeat(var(--event-count, 1), 1fr); gap: 2px; overflow: hidden;
+  position: sticky; /* ثابت ماندن ردیف all-day */
+  left: 4rem; /* بعد از day-label */
+  background-color: var(--color-surface); /* برای پوشاندن تایم‌لاین */
+  z-index: 4;
+ }
+.timeline-cell {
+  position: relative; /* برای event-wrapper */
+  background-image: repeating-linear-gradient(to left, var(--color-border-soft) 0 1px, transparent 1px 100%), repeating-linear-gradient(to left, var(--color-border) 0 1px, transparent 1px 100%);
+  background-size: calc(100% / 48) 100%, calc(100% / 24) 100%;
+  min-height: 100%;
+}
+.is-holiday .day-label { background-color: #ffebee !important; } /* (*** اصلاح‌شده ***) */
+.is-holiday .all-day-cell { background-color: #ffebee !important; } /* (*** اصلاح‌شده ***) */
+.is-holiday .timeline-cell { background-color: #fff0f0; } /* رنگ ملایم‌تر برای پس‌زمینه تایم‌لاین */
+
+
+/* (*** اصلاح‌شده ***) استایل نشانگر زمان */
+.time-indicator {
+  position: absolute;
+  background-color: var(--color-danger);
+  z-index: 15;
+  pointer-events: none;
+  opacity: 0.8;
+  /* transition حذف شد تا حرکت آنی باشد */
+}
+/* دسکتاپ */
+.time-indicator.desktop {
+  top: 0;
+  height: 100%;
+  width: 2px;
+}
+.time-indicator.desktop::before {
+  content: ''; position: absolute; top: -5px; right: -4px; width: 10px; height: 10px;
+  background-color: var(--color-danger); border-radius: 50%;
+}
+/* موبایل */
+.time-indicator.mobile {
+  /* left و width توسط JS تنظیم می‌شود */
+  height: 2px;
+  /* top توسط JS تنظیم می‌شود */
+}
+.time-indicator.mobile::before {
+    content: ''; position: absolute; top: -4px; right: -5px; width: 10px; height: 10px;
+    background-color: var(--color-danger); border-radius: 50%;
+}
+
+
+/* ==========================================================================
+   9. Event Styles (بدون تغییر)
+   ========================================================================== */
+.event, .event-allday {
+  border-radius: 4px;
+ padding: 2px 4px; font-size: 0.7rem; overflow: hidden;
+  text-align: center; display: flex;
+  align-items: center;
+ justify-content: flex-start;
+  cursor: pointer; transition: all 0.2s;
+  position: relative;
+}
+.event-wrapper { position: absolute; box-sizing: border-box; padding: 2px 3px 8px 12px; z-index: 10;
+ }
+.event { width: 100%; height: 100%; border: 1px solid rgba(0,0,0,0.2);
+ }
+.event-wrapper:hover .event { z-index: 11; box-shadow: var(--shadow-soft); transform: scale(1.02); }
+
+.event-content {
+    flex-grow: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; overflow: hidden; padding: 0 4px; text-align: center;
+}
+
+.event[data-ismultiday="true"]:not([data-isstart="true"]) { border-top-right-radius: 0; border-bottom-right-radius: 0; border-right-width: 0;
+ padding-right: 0; }
+.event[data-ismultiday="true"]:not([data-isend="true"]) { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 1px solid rgba(255,255,255,0.3); }
+
+.event-title { font-family: var(--font-family-bold); font-size: 0.7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.event-meta { opacity: 0.9; font-size: 0.6rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+
+.event-dept.vertical {
+  writing-mode: vertical-rl; text-orientation: mixed; transform: rotate(180deg); font-size: 0.6rem;
+  font-family: var(--font-family-bold); background: rgba(0,0,0,0.2); padding: 4px 2px; border-radius: 3px;
+  align-self: stretch; display: flex; align-items: center; justify-content: center; margin-left: 4px;
+  max-height: 90%; overflow: hidden; white-space: nowrap; line-height: 1; flex-shrink: 0;
+}
+.event.event-ultra-condensed .event-content { padding: 0 2px; }
+.event.event-ultra-condensed .event-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.event.event-ultra-condensed .event-meta { display: none; }
+.event.event-ultra-condensed .event-dept.vertical { font-size: 0.5rem; padding: 2px 1px; margin-left: 2px; }
+
+/* -- Event Statuses -- */
+.event.status-approved, .event-allday.status-approved { color: white; }
+.event.status-pending, .event-allday.status-pending { background-color: #fff9c4; color: #333; border-color: #fbc02d; background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.05) 0, rgba(0,0,0,0.05) 5px, transparent 5px, transparent 10px); }
+.event.status-rejected, .event-allday.status-rejected { background-color: #eeeeee; color: #757575; border-color: #9e9e9e; opacity: 0.8;
+ background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.1) 0, rgba(0,0,0,0.1) 5px, transparent 5px, transparent 10px); }
+.event.status-rejected .event-title::after, .event-allday.status-rejected .event-title::after { content: "(رد شده)"; color: var(--color-danger); font-size: 0.9em; margin-right: 4px; }
+.event-locked { cursor: not-allowed !important; }
+
+/* ==========================================================================
+   10. Color Legend (بدون تغییر)
+   ========================================================================== */
+#color-legend-container { position: relative; }
+#color-legend-btn { background: none; border: 1px solid var(--color-border); padding: 0.4rem 0.8rem; font-size: 0.9rem; border-radius: 6px; color: var(--color-text); }
+#color-legend-popup { display: none; position: absolute; top: 100%; right: 0; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--border-radius); box-shadow: var(--shadow-soft);
+ padding: 1rem; width: 250px; z-index: 100; margin-top: 5px; }
+#color-legend-popup h4 { margin: 0 0 1rem 0; padding-bottom: 0.5rem;
+ border-bottom: 1px solid var(--color-border-soft); font-family: var(--font-family-bold); }
+#color-legend-popup ul { list-style: none; padding: 0; margin: 0; }
+#color-legend-popup li { display: flex; align-items: center; margin-bottom: 0.5rem; }
+#color-legend-popup .legend-swatch { width: 20px; height: 20px; border-radius: 4px; margin-left: 0.75rem; border: 1px solid rgba(0,0,0,0.1); }
+
+/* ==========================================================================
+   11. Manager Settings Modals Styles (بدون تغییر)
+   ========================================================================== */
+#depts-list-editor .dept-item { display: grid;
+ grid-template-columns: 1fr 1fr auto auto; gap: 1rem; align-items: center; background: #f9f9f9; padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; }
+#users-list-editor .user-item { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 1rem; align-items: center; background: #f9f9f9; padding: 1rem; border-radius: 8px;
+ margin-bottom: 0.75rem; font-size: 0.9rem; }
+#users-list-editor .user-item-permissions { grid-column: 1 / -1; font-size: 0.9rem; padding-top: 1rem; margin-top: 1rem;
+ border-top: 1px solid var(--color-border-soft); }
+.permission-group { margin-bottom: 1rem; }
+.permission-group h5 { margin: 0 0 0.5rem 0; font-family: var(--font-family-bold); }
+.permission-group-items { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; max-height: 100px; overflow-y: auto; background: white; padding: 0.5rem; border-radius: 6px;
+ border: 1px solid var(--color-border); }
+.permission-group-items label { font-weight: normal; font-size: 0.9rem; }
+.permission-group-items input { width: auto; margin-left: 0.5rem; }
+#users-list-editor .user-item-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 0.5rem; padding-top: 1rem; margin-top: 1rem;
+ border-top: 1px solid var(--color-border); }
+#users-list-editor .user-item-actions button { padding: 0.5rem; font-size: 0.8rem; flex: 0 1 auto; width: 100px; }
+#issues-list-container .issue-item { background: #f9f9f9; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; border-right: 5px solid var(--color-warning); }
+#issues-list-container .issue-item p { margin: 0.5rem 0; font-size: 1rem; }
+#issues-list-container .issue-meta { font-size: 0.8rem; color: var(--color-text-muted); }
+
+/* ==========================================================================
+   12. Evaluator List View (بدون تغییر)
+   ========================================================================== */
+#calendar-list-container h2 { font-family: var(--font-family-black);
+ color: var(--color-primary);
+  border-bottom: 2px solid var(--color-border); padding-bottom: 0.5rem; margin-top: 0; }
+.list-view-item {
+  background: var(--color-surface); border-radius: var(--border-radius); margin-bottom: 1rem;
+ box-shadow: 0 2px 5px rgba(0,0,0,0.05); border: 1px solid var(--color-border-soft);
+  display: grid; grid-template-columns: 200px 1fr 2fr; align-items: center;
+ border-right: 5px solid var(--color-border-soft); transition: border-color 0.2s;
+ }
+.list-view-item.status-pending { border-right-color: var(--color-warning); }
+.list-view-item.status-rejected { border-right-color: #9e9e9e; opacity: 0.8; }
+.list-view-time { padding: 1.5rem; font-family: var(--font-family-bold); font-size: 1rem; text-align: center; border-left: 1px solid var(--color-border-soft); }
+.list-view-time .list-day { font-size: 0.9rem; font-family: var(--font-family-base); color: var(--color-text-muted); }
+.list-view-details { padding: 1.5rem; border-left: 1px solid var(--color-border-soft); }
+.list-view-details h4 { margin: 0 0 0.5rem 0; font-family: var(--font-family-bold); color: var(--color-primary); }
+.list-view-details span { font-size: 0.9rem; color: var(--color-text-muted); display: block; }
+.list-view-goal { padding: 1.5rem; }
+.list-view-goal h5 { margin: 0 0 0.5rem 0; font-size: 0.9rem; color: var(--color-text-muted); }
+.list-view-goal p { margin: 0; font-size: 0.9rem; line-height: 1.6; }
+
+/* ==========================================================================
+   13. Mobile & Print (*** اصلاح‌شده برای ارتفاع 100% و sticky ***)
+   ========================================================================== */
+@media (max-width: 768px) {
+  /* مخفی کردن دکمه‌های هفته */
+  .week-nav-btn { display: none; }
+
+  /* اصلاح هدر اصلی */
+  .main-header {
+      padding: 0.5rem; flex-wrap: wrap; justify-content: center;
+      position: relative; /* دیگر sticky نیست */
+      height: auto; /* ارتفاع خودکار */
+      min-height: var(--mobile-header-height); /* حداقل ارتفاع */
+   }
+  .week-navigator { order: -1; width: 100%; margin-bottom: 0.5rem; }
+  .week-navigator h1 { font-size: 1.1rem; min-width: 280px; }
+  .header-controls { flex-basis: auto; }
+  .header-controls.right-controls { flex-grow: 1; justify-content: flex-end; }
+
+  #users-list-editor .user-item { grid-template-columns: 1fr 1fr; }
+  #users-list-editor .user-item-actions { grid-column: 1 / -1; flex-direction: row; }
+  .list-view-item { grid-template-columns: 1fr; }
+  .list-view-time, .list-view-details { border-left: none; border-bottom: 1px solid var(--color-border-soft); }
+
+   /* اصلاح گرید موبایل */
+  #calendar-grid-container {
+      height: calc(100vh - var(--mobile-header-height)); /* ارتفاع باقیمانده */
+  }
+  .mobile-grid {
+    display: flex; flex-direction: row;
+    height: 100%; /* ارتفاع کامل والد */
+    overflow: hidden;
+    --mobile-day-count: 7;
+    --mobile-hour-zoom: 2;
+
+    /* ارتفاع‌ها بر اساس زوم و ارتفاع موجود */
+    --h1-height: calc(var(--mobile-timeline-available-height) / 8);
+    --h2-height: calc(var(--mobile-timeline-available-height) / 12);
+    --h3-height: calc(var(--mobile-timeline-available-height) / 24);
+    --h4-height: 4rem; /* Fixed larger height */
+
+    --timeline-h1: var(--mobile-timeline-available-height);
+    --timeline-h2: var(--mobile-timeline-available-height);
+    --timeline-h3: var(--mobile-timeline-available-height);
+    --timeline-h4: calc(var(--h4-height) * 24); /* Scrolls */
+  }
+
+  .mobile-time-axis {
+    display: flex; flex-direction: column; flex-shrink: 0;
+    width: 4rem; background-color: var(--color-surface); border-left: 1px solid var(--color-border);
+    touch-action: pan-x;
+    position: sticky; /* ثابت ماندن محور زمان */
+    top: 0; /* چسبیدن به بالای والد (.mobile-grid) */
+    left: 0;
+    z-index: 10;
+    height: 100%; /* ارتفاع کامل والد */
+    overflow: hidden; /* جلوگیری از اسکرول داخلی */
+    box-sizing: border-box;
+  }
+
+  .time-axis-corner {
+    height: var(--mobile-time-axis-corner-height);
+    border-bottom: 2px solid var(--color-border);
+    flex-shrink: 0;
+    position: sticky; /* چسبیدن به بالا */
+    top: 0;
+    background: var(--color-surface);
+    z-index: 11;
+    box-sizing: border-box;
+  }
+
+  .time-label-mobile {
+    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 0.8rem; color: var(--color-text-muted); border-bottom: 1px solid var(--color-border);
+    transition: height 0.2s ease-out;
+    box-sizing: border-box;
+  }
+
+  /* اعمال ارتفاع بر اساس زوم */
+  .mobile-grid[style*="--mobile-hour-zoom: 1;"] .time-label-mobile:not(.all-day-header) { height: var(--h1-height); }
+  .mobile-grid[style*="--mobile-hour-zoom: 2;"] .time-label-mobile:not(.all-day-header) { height: var(--h2-height); }
+  .mobile-grid[style*="--mobile-hour-zoom: 3;"] .time-label-mobile:not(.all-day-header) { height: var(--h3-height); }
+  .mobile-grid[style*="--mobile-hour-zoom: 4;"] .time-label-mobile:not(.all-day-header) { height: var(--h4-height); }
+
+
+  .time-label-mobile.all-day-header {
+      height: var(--mobile-allday-row-height); font-family: var(--font-family-bold); color: var(--color-text);
+     border-bottom: 2px solid var(--color-border); flex-shrink: 0;
+     position: sticky; /* چسبیدن زیر corner */
+     top: var(--mobile-time-axis-corner-height);
+     background: var(--color-surface);
+     z-index: 11;
+     box-sizing: border-box;
+ }
+
+  .mobile-days-container {
+    display: flex; flex-direction: row; flex-grow: 1;
+    overflow: auto; /* (*** اصلاح‌شده ***) فعال کردن هر دو اسکرول */
+    scroll-snap-type: x mandatory;
+    position: relative;
+    height: 100%; /* ارتفاع کامل والد */
+    overscroll-behavior-x: contain;
+    box-sizing: border-box;
+  }
+
+  .day-column {
+    display: flex; flex-direction: column;
+    width: calc(100vw / var(--mobile-day-count));
+    min-width: calc((100vw - 4rem) / 7);
+    flex-shrink: 0;
+    scroll-snap-align: start;
+    border-right: 2px solid var(--color-border);
+    position: relative;
+    height: auto; /* ارتفاع خودکار بر اساس محتوا */
+    transition: width 0.2s ease-out;
+    box-sizing: border-box;
+ }
+  .day-column:first-child { border-right: 2px solid var(--color-border); }
+  .day-column .day-label {
+    border-left: none; border-bottom: 2px solid var(--color-border);
+    padding: 0.5rem;
+    height: var(--mobile-time-axis-corner-height);
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    background-color: var(--color-surface);
+    z-index: 5;
+    box-sizing: border-box;
+    /* (*** جدید ***) برای هماهنگی با time-axis-corner */
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  .day-column .all-day-cell {
+    min-height: var(--mobile-allday-row-height);
+    border-left: none; border-bottom: 2px solid var(--color-border);
+    flex-shrink: 0;
+    position: sticky;
+    top: var(--mobile-time-axis-corner-height);
+    background-color: var(--color-surface);
+    z-index: 5;
+    box-sizing: border-box;
+    /* (*** جدید ***) برای grid layout داخلی */
+    padding: 2px; display: grid; grid-template-rows: repeat(var(--event-count, 1), 1fr); gap: 2px; overflow: hidden;
+  }
+   /* رنگ پس‌زمینه برای روز تعطیل */
+  .day-column.is-holiday .day-label,
+  .day-column.is-holiday .all-day-cell {
+    background-color: #ffebee !important;
+  }
+
+  .day-column .timeline-cell {
+    border-left: none; flex-grow: 1; /* گرفتن فضای باقیمانده */
+    background-image: repeating-linear-gradient(to bottom, var(--color-border-soft) 0 1px, transparent 1px 100%), repeating-linear-gradient(to bottom, var(--color-border) 0 1px, transparent 1px 100%);
+    position: relative; /* برای event-wrapper */
+    transition: min-height 0.2s ease-out;
+    box-sizing: border-box;
+    /* (*** اصلاح‌شده ***) ارتفاع دقیق بر اساس زوم */
+    min-height: var(--timeline-h1); /* پیش‌فرض */
+  }
+
+  /* اعمال ارتفاع Timeline بر اساس زوم */
+  .mobile-grid[style*="--mobile-hour-zoom: 1;"] .timeline-cell {
+      background-size: 100% calc(100% / 8), 100% calc(100% / 8);
+      min-height: var(--timeline-h1);
+  }
+  .mobile-grid[style*="--mobile-hour-zoom: 2;"] .timeline-cell {
+      background-size: 100% calc(100% / 12), 100% calc(100% / 12);
+      min-height: var(--timeline-h2);
+  }
+  .mobile-grid[style*="--mobile-hour-zoom: 3;"] .timeline-cell {
+      background-size: 100% calc(100% / 48), 100% calc(100% / 24);
+      min-height: var(--timeline-h3);
+  }
+  .mobile-grid[style*="--mobile-hour-zoom: 4;"] .timeline-cell {
+      background-size: 100% calc(100% / 48), 100% calc(100% / 24);
+      min-height: var(--timeline-h4); /* باعث اسکرول می‌شود */
+  }
+
+
+  .day-column .event-wrapper { padding: 2px; box-sizing: border-box; }
+  .day-column .event, .day-column .event-allday { justify-content: flex-start; padding-top: 5px; align-items: center; box-sizing: border-box; }
+  .event-dept.vertical { font-size: 0.5rem; padding: 2px 1px; margin-left: 2px;}
+}
+
+@media print {
+  body { overflow: visible !important; height: auto !important; font-size: 8pt; background: #fff; }
+  .page-container { height: auto; border: 3px double #333; padding: 0.5cm; box-sizing: border-box; }
+  .main-header { padding: 0 0 0.5cm 0; text-align: center; box-shadow: none; border-bottom: 2px solid #333; margin-bottom: 0.5cm;
+ position: static !important; height: auto !important; }
+  .main-header h1 { font-size: 1.5rem; }
+
+  #calendar-grid-container { height: auto !important; overflow: visible !important; }
+  .calendar-grid, .mobile-grid { border: 1px solid #666; height: auto !important; }
+
+  .grid-body, .mobile-days-container {
+    overflow: visible !important;
+    height: auto !important;
+  }
+  .day-row {
+    height: auto !important; min-height: unset !important; page-break-inside: avoid;
+  }
+  .day-column .timeline-cell { min-height: unset !important; }
+   .day-label, .all-day-cell, .mobile-time-axis, .time-axis-corner, .grid-header {
+       position: static !important; /* حذف sticky در پرینت */
+   }
+
+  .event, .event-allday { box-shadow: none; border: 1px solid #777; }
+  .fab-container, .modal-overlay, #loader-overlay, .header-controls, .week-nav-btn { display: none; }
+  #calendar-list-container { display: none; }
+  .time-indicator { display: none; }
+}
+
+data/.htaccess
+
+Deny from all
+
+data/data.json
+
+{
+    "settings": {
+        "headerText": "تقویم اجرایی",
+        "weekStartDate": "2025-10-25"
+    },
+    "holidays": [
+        {
+            "day": 6,
+            "occasion": "جمعه"
+        }
+    ],
+    "departments": [
+        {
+            "id": "d1",
+            "name": "دپارتمان تولید",
+            "color": "#fd7e14"
+        },
+        {
+            "id": "d2",
+            "name": "دپارتمان فنی",
+            "color": "#0d6efd"
+        },
+        {
+            "id": "d3",
+            "name": "دپارتمان بازرگانی",
+            "color": "#198754"
+        }
+    ],
+    "events": [
+        {
+            "id": 1729328400000,
+            "title": "جلسه بازبینی تولید",
+            "by": "تیم تولید",
+            "for": "همه",
+            "color": "#fd7e14",
+            "textColor": "#ffffff",
+            "isAllDay": false,
+            "proposerId": "u_proposer_1",
+            "departmentId": "d1",
+            "status": "approved",
+            "goal": "بررسی پیشرفت پروژه X و مشکلات خط تولید.",
+            "startDateTime": "2025-10-11T12:00:00+03:30",
+            "endDateTime": "2025-10-11T15:00:00+03:30"
+        },
+        {
+            "id": "1729328400001",
+            "title": "رویداد چند روزه فنی",
+            "by": "تیم فنی",
+            "for": "مدیران",
+            "color": "#0d6efd",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "proposerId": "u_evaluator_1",
+            "departmentId": "d2",
+            "status": "approved",
+            "goal": "اعمال پچ‌های امنیتی و مانیتورینگ سرورها طی ۳ روز.",
+            "startDateTime": "2025-10-12T00:00:00",
+            "endDateTime": "2025-10-13T00:00:00"
+        },
+        {
+            "id": 1729328400002,
+            "title": "رویداد تمام روز (تعطیلات)",
+            "by": "منابع انسانی",
+            "for": "همه",
+            "color": "#198754",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "proposerId": "u_manager_1",
+            "departmentId": "d3",
+            "status": "approved",
+            "goal": "رویداد داخلی شرکت.",
+            "startDateTime": "2025-10-15T00:00:00",
+            "endDateTime": "2025-10-15T24:00:00"
+        },
+        {
+            "id": "1761326930668",
+            "title": "برنامه ۱",
+            "by": "امیر محمد",
+            "for": "مخاطبان",
+            "goal": "برنامه ۲",
+            "isAllDay": false,
+            "startDateTime": "2025-10-21T06:00:00+03:30",
+            "endDateTime": "2025-10-22T09:00:00+03:30",
+            "proposerId": "u_proposer_1",
+            "departmentId": "d1",
+            "status": "approved",
+            "color": "#fd7e14",
+            "textColor": "#ffffff"
+        }
+    ]
+}
+
+data/issues.json
+
+[
+    {
+        "id": 1761224509,
+        "userId": "u_manager_1",
+        "userName": "مدیر سیستم",
+        "text": "پیام ۱\nمشکل سیستم چیه؟",
+        "timestamp": "2025-10-23T15:01:49+02:00",
+        "status": "new"
+    }
+]
+
+data/users.json
+
+[
+    {
+        "id": "u_manager_1",
+        "username": "admin",
+        "displayName": "مدیر سیستم",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "manager",
+        "departmentId": null,
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": true,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_proposer_1",
+        "username": "amir",
+        "displayName": "امیر محمد",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "proposer",
+        "departmentId": "d1",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d1"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_evaluator_1",
+        "username": "evaluator",
+        "displayName": "ارزیاب فنی",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "evaluator",
+        "departmentId": "d2",
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_viewer_1",
+        "username": "viewer",
+        "displayName": "بیننده (بازرگانی)",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "viewer",
+        "departmentId": "d3",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d3"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    }
+]
+

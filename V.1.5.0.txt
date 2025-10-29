@@ -1,0 +1,2433 @@
+api.php
+
+<?php
+session_start();
+header('Content-Type: application/json; charset=utf-8');
+
+// مسیر فایل‌های داده
+define('DATA_FILE', './data/data.json');
+define('USERS_FILE', './data/users.json');
+define('ISSUES_FILE', './data/issues.json');
+
+// --- بررسی احراز هویت ---
+if (!isset($_SESSION['user_id'])) {
+    http_response_code(401);
+    echo json_encode(['success' => false, 'message' => 'Unauthorized']);
+    exit;
+}
+
+// --- اطلاعات کاربر فعلی از سشن ---
+$CURRENT_USER_ID = $_SESSION['user_id'];
+$CURRENT_USER_ROLE = $_SESSION['role'];
+$CURRENT_USER_DEPT_ID = $_SESSION['departmentId'];
+$CURRENT_USER_PERMS = $_SESSION['permissions'];
+
+// --- توابع کمکی خواندن/نوشتن ---
+function readData($file) {
+    if (!file_exists($file)) return null;
+    $content = file_get_contents($file);
+    if ($content === false) return null;
+    return json_decode($content, true);
+}
+function writeData($file, $data) {
+    return file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+
+// --- مدیریت اکشن‌ها ---
+$action = $_GET['action'] ?? '';
+$input = json_decode(file_get_contents('php://input'), true);
+
+try {
+    if (readData(DATA_FILE) === null || readData(USERS_FILE) === null || readData(ISSUES_FILE) === null) {
+        throw new Exception('خطای بحرانی: یک یا چند فایل داده (data.json, users.json, issues.json) یافت نشدند یا قابل خواندن نیستند.');
+    }
+
+    switch ($action) {
+        
+        case 'getData':
+            $data = readData(DATA_FILE);
+            $all_users = readData(USERS_FILE);
+            $filteredEvents = [];
+
+            if ($CURRENT_USER_ROLE === 'manager' || $CURRENT_USER_ROLE === 'evaluator') {
+                foreach ($data['events'] as $event) {
+                    if ($event['status'] === 'approved' || $event['status'] === 'pending') {
+                        $filteredEvents[] = $event;
+                    }
+                }
+            } else { 
+                $view_all_depts = $CURRENT_USER_PERMS['view_all_depts'] ?? false;
+                $view_depts = $CURRENT_USER_PERMS['view_depts'] ?? [];
+                $view_all_users = $CURRENT_USER_PERMS['view_all_users'] ?? false;
+                $view_users = $CURRENT_USER_PERMS['view_users'] ?? [];
+
+                foreach ($data['events'] as $event) {
+                    $isOwnEvent = $event['proposerId'] === $CURRENT_USER_ID;
+
+                    if ($isOwnEvent) {
+                        $filteredEvents[] = $event;
+                        continue;
+                    }
+                    if ($event['status'] !== 'approved') {
+                        continue;
+                    }
+                    
+                    $hasDeptAccess = $view_all_depts || in_array($event['departmentId'], $view_depts);
+                    $hasUserAccess = $view_all_users || in_array($event['proposerId'], $view_users);
+                    
+                    if ($hasDeptAccess || $hasUserAccess) {
+                        $filteredEvents[] = $event;
+                    }
+                }
+            }
+            
+            $data['events'] = $filteredEvents;
+            $data['users'] = array_map(function($user) {
+                unset($user['password_hash']);
+                return $user;
+            }, $all_users);
+
+            echo json_encode(['success' => true, 'data' => $data]);
+            break;
+
+        case 'saveSettings':
+            // این اکشن اکنون هم توسط مدیر (در مودال) و هم توسط همه (برای پیمایش هفته) استفاده می‌شود
+            // if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied'); // این محدودیت را برمیداریم
+            $data = readData(DATA_FILE);
+            if (isset($input['headerText'])) {
+                 $data['settings']['headerText'] = $input['headerText'];
+            }
+            if (isset($input['weekStartDate'])) {
+                 $data['settings']['weekStartDate'] = $input['weekStartDate'];
+            }
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'تنظیمات ذخیره شد']);
+            break;
+
+        // --- (اصلاح‌شده) ذخیره رویداد ---
+        case 'saveEvent':
+            if ($CURRENT_USER_ROLE === 'viewer') throw new Exception('Access Denied');
+            
+            $data = readData(DATA_FILE);
+            $eventData = $input['event'];
+            $isEditing = !empty($eventData['id']);
+
+            // (جدید) مدیریت رویداد تمام روز
+            if ($eventData['isAllDay']) {
+                $eventData['startTime'] = "00:00";
+                // اگر تمام روز بود، مطمئن شو پایان روز است
+                if ($eventData['endDay'] < $eventData['startDay']) {
+                    $eventData['endDay'] = $eventData['startDay'];
+                }
+                $eventData['endTime'] = "24:00";
+            }
+
+            // اعتبار سنجی روز/زمان
+            if ($eventData['endDay'] < $eventData['startDay']) {
+                throw new Exception("روز پایان نمی‌تواند قبل از روز شروع باشد.");
+            }
+            if ($eventData['endDay'] == $eventData['startDay'] && $eventData['endTime'] <= $eventData['startTime']) {
+                throw new Exception("ساعت پایان باید بعد از ساعت شروع باشد.");
+            }
+            
+            if ($isEditing) {
+                $eventIndex = array_search($eventData['id'], array_column($data['events'], 'id'));
+                if ($eventIndex === false) throw new Exception('Event not found');
+                $existingEvent = $data['events'][$eventIndex];
+
+                $canEdit = $CURRENT_USER_ROLE === 'manager' || 
+                           $CURRENT_USER_ROLE === 'evaluator' ||
+                           ($existingEvent['proposerId'] === $CURRENT_USER_ID && $existingEvent['status'] !== 'approved');
+                if (!$canEdit) throw new Exception('Access Denied to edit this event');
+
+                $updatedEvent = array_merge($existingEvent, $eventData);
+                
+                if ($CURRENT_USER_ROLE !== 'manager' && $updatedEvent['status'] === 'rejected') {
+                    $updatedEvent['status'] = 'pending';
+                }
+                if (($CURRENT_USER_ROLE === 'manager' || $CURRENT_USER_ROLE === 'evaluator') && !isset($eventData['status'])) {
+                     $updatedEvent['status'] = 'approved';
+                }
+                
+                $data['events'][$eventIndex] = $updatedEvent;
+                $message = 'رویداد با موفقیت ویرایش شد';
+
+            } else {
+                $dept = null;
+                if ($CURRENT_USER_DEPT_ID) {
+                    $dept = array_values(array_filter($data['departments'], fn($d) => $d['id'] === $CURRENT_USER_DEPT_ID))[0] ?? null;
+                }
+                
+                $newEvent = $eventData;
+                $newEvent['id'] = time() . rand(100, 999);
+                $newEvent['proposerId'] = $CURRENT_USER_ID;
+                $newEvent['departmentId'] = $CURRENT_USER_DEPT_ID;
+                
+                if ($CURRENT_USER_ROLE === 'manager' || $CURRENT_USER_ROLE === 'evaluator') {
+                    $newEvent['status'] = 'approved';
+                    $message = 'رویداد با موفقیت افزوده شد';
+                } else { // Proposer
+                    $newEvent['status'] = 'pending';
+                    $message = 'پیشنهاد شما ثبت شد و در انتظار تایید است';
+                    $newEvent['color'] = $dept['color'] ?? '#c8c8c8';
+                    $newEvent['textColor'] = $eventData['textColor'] ?? '#ffffff';
+                }
+                $data['events'][] = $newEvent;
+            }
+            
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => $message]);
+            break;
+
+        case 'updateEventStatus':
+            if ($CURRENT_USER_ROLE !== 'manager' && $CURRENT_USER_ROLE !== 'evaluator') throw new Exception('Access Denied');
+            $data = readData(DATA_FILE);
+            $eventId = $input['id'];
+            $newStatus = $input['status'];
+            $eventIndex = array_search($eventId, array_column($data['events'], 'id'));
+            if ($eventIndex === false) throw new Exception('Event not found');
+            $data['events'][$eventIndex]['status'] = $newStatus;
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'وضعیت رویداد به‌روز شد']);
+            break;
+
+        case 'deleteEvent':
+            $data = readData(DATA_FILE);
+            $eventId = $input['id'];
+            $eventIndex = array_search($eventId, array_column($data['events'], 'id'));
+            if ($eventIndex === false) throw new Exception('Event not found');
+            $existingEvent = $data['events'][$eventIndex];
+            $canDelete = $CURRENT_USER_ROLE === 'manager' || 
+                         $CURRENT_USER_ROLE === 'evaluator' ||
+                         ($existingEvent['proposerId'] === $CURRENT_USER_ID && $existingEvent['status'] !== 'approved');
+            if (!$canDelete) throw new Exception('Access Denied');
+            array_splice($data['events'], $eventIndex, 1);
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'رویداد حذف شد']);
+            break;
+            
+        case 'manageDepartments':
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $data = readData(DATA_FILE);
+            $data['departments'] = $input['departments'];
+            writeData(DATA_FILE, $data);
+            echo json_encode(['success' => true, 'message' => 'دپارتمان‌ها به‌روزرسانی شدند']);
+            break;
+
+        case 'manageUsers':
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $users = readData(USERS_FILE);
+            $sub_action = $input['sub_action'] ?? '';
+            $clientUser = $input['user'] ?? null;
+            switch ($sub_action) {
+                case 'delete':
+                    if (empty($clientUser['id'])) throw new Exception('User ID required');
+                    if ($clientUser['id'] === $CURRENT_USER_ID) throw new Exception('شما نمی‌توانید حساب کاربری خود را حذف کنید.');
+                    $users = array_filter($users, fn($u) => $u['id'] !== $clientUser['id']);
+                    $message = 'کاربر با موفقیت حذف شد';
+                    break;
+                case 'save':
+                    if (empty($clientUser['username'])) throw new Exception('نام کاربری الزامی است');
+                    if (empty($clientUser['displayName'])) throw new Exception('نام نمایشی الزامی است');
+                    $isEditing = !empty($clientUser['id']);
+                    if ($isEditing) {
+                        $userIndex = array_search($clientUser['id'], array_column($users, 'id'));
+                        if ($userIndex === false) throw new Exception('User not found');
+                        $users[$userIndex]['username'] = $clientUser['username'];
+                        $users[$userIndex]['displayName'] = $clientUser['displayName'];
+                        $users[$userIndex]['role'] = $clientUser['role'];
+                        $users[$userIndex]['departmentId'] = $clientUser['departmentId'];
+                        $users[$userIndex]['permissions'] = $clientUser['permissions'];
+                        if (!empty($clientUser['password'])) {
+                            $users[$userIndex]['password_hash'] = password_hash($clientUser['password'], PASSWORD_DEFAULT);
+                        }
+                        $message = 'کاربر با موفقیت ویرایش شد';
+                    } else {
+                        if (empty($clientUser['password'])) throw new Exception('رمز عبور برای کاربر جدید الزامی است');
+                        $newUser = $clientUser;
+                        $newUser['id'] = 'u_' . time();
+                        $newUser['password_hash'] = password_hash($clientUser['password'], PASSWORD_DEFAULT);
+                        unset($newUser['password']);
+                        $users[] = $newUser;
+                        $message = 'کاربر با موفقیت افزوده شد';
+                    }
+                    break;
+                default:
+                    throw new Exception('Invalid sub-action for manageUsers');
+            }
+            writeData(USERS_FILE, array_values($users));
+            $updatedUsers = array_map(function($user) {
+                unset($user['password_hash']);
+                return $user;
+            }, readData(USERS_FILE));
+            echo json_encode(['success' => true, 'message' => $message, 'data' => $updatedUsers]);
+            break;
+
+        case 'reportIssue':
+            $issues = readData(ISSUES_FILE);
+            $newIssue = [
+                'id' => time(),
+                'userId' => $CURRENT_USER_ID,
+                'userName' => $_SESSION['displayName'],
+                'text' => $input['text'],
+                'timestamp' => date('c'),
+                'status' => 'new'
+            ];
+            $issues[] = $newIssue;
+            writeData(ISSUES_FILE, $issues);
+            echo json_encode(['success' => true, 'message' => 'پیام شما با موفقیت ثبت شد.']);
+            break;
+            
+        case 'getIssues':
+            if ($CURRENT_USER_ROLE !== 'manager') throw new Exception('Access Denied');
+            $issues = readData(ISSUES_FILE);
+            usort($issues, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
+            echo json_encode(['success' => true, 'data' => $issues]);
+            break;
+
+        default:
+            http_response_code(400);
+            throw new Exception('Invalid Action');
+    }
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+}
+
+?>
+
+app.js
+
+document.addEventListener('DOMContentLoaded', () => {
+
+    // --- State Variables ---
+    let fullData = { settings: {}, events: [], holidays: [], departments: [], users: [] };
+    const WEEK_DAYS = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'];
+    let currentView = 'grid'; // 'grid' or 'list'
+    let currentWeekStartDate = new Date(); // (جدید) تاریخ شروع هفته فعلی
+    
+    // --- Element Selectors ---
+    const calendarGridContainer = document.getElementById('calendar-grid-container');
+    const calendarListContainer = document.getElementById('calendar-list-container');
+    const calendarTitle = document.getElementById('calendar-title');
+    const loader = document.getElementById('loader-overlay');
+    const legendBtn = document.getElementById('color-legend-btn');
+    const legendPopup = document.getElementById('color-legend-popup');
+    const viewToggleBtn = document.getElementById('view-toggle-btn');
+    const prevWeekBtn = document.getElementById('prev-week-btn');
+    const nextWeekBtn = document.getElementById('next-week-btn');
+
+    // --- (جدید) FAB Menu Elements ---
+    const fabMainBtn = document.getElementById('fab-main-btn');
+    const fabMenu = document.getElementById('fab-menu');
+
+    // --- Event Modal Elements ---
+    const eventModal = document.getElementById('event-modal');
+    const eventModalTitle = document.getElementById('event-modal-title');
+    const eventForm = document.getElementById('event-form');
+    const eventIdInput = document.getElementById('eventId');
+    const eventTitleInput = document.getElementById('eventTitle');
+    const eventByInput = document.getElementById('eventBy');
+    const eventForInput = document.getElementById('eventFor');
+    const eventGoalGroup = document.getElementById('event-goal-group');
+    const eventGoalInput = document.getElementById('eventGoal');
+    const isAllDayCheckbox = document.getElementById('isAllDay');
+    // (جدید) فیلدهای شروع و پایان
+    const startDaySelect = document.getElementById('startDay');
+    const startTimeInput = document.getElementById('startTime');
+    const endDaySelect = document.getElementById('endDay');
+    const endTimeInput = document.getElementById('endTime');
+    
+    const approvalActions = document.getElementById('approval-actions');
+    const approveEventBtn = document.getElementById('approve-event-btn');
+    const rejectEventBtn = document.getElementById('reject-event-btn');
+    const deleteEventBtn = document.getElementById('delete-event-btn');
+    const saveEventBtn = document.getElementById('save-event-btn');
+    const cancelEventBtn = document.getElementById('cancel-event-btn');
+    const managerColorInputs = document.getElementById('event-colors-manager');
+    
+    // --- Settings Modal Elements ---
+    const settingsModal = document.getElementById('settings-modal');
+    const mainHeaderInput = document.getElementById('mainHeader');
+    const weekSelector = document.getElementById('weekSelector');
+
+    // --- Depts Modal Elements ---
+    const deptsModal = document.getElementById('depts-modal');
+    const deptsListEditor = document.getElementById('depts-list-editor');
+
+    // --- Users Modal Elements ---
+    const usersModal = document.getElementById('users-modal');
+    const usersListEditor = document.getElementById('users-list-editor');
+
+    // --- Issue Modals Elements ---
+    const issueModal = document.getElementById('issue-modal');
+    const issueTextInput = document.getElementById('issue-text');
+    const viewIssuesModal = document.getElementById('view-issues-modal');
+    const issuesListContainer = document.getElementById('issues-list-container');
+
+    // --- Helper Functions ---
+    const showLoader = () => loader.classList.remove('hidden');
+    const hideLoader = () => loader.classList.add('hidden');
+    const toPersian = (str) => String(str).replace(/[0-9]/g, (w) => '۰۱۲۳۴۵۶۷۸۹'[+w]);
+    const timeToMinutes = (timeStr) => {
+        if (!timeStr) return 0;
+        const [h, m] = timeStr.split(':').map(Number);
+        return h * 60 + m;
+    };
+    const formatDate = (date) => {
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    };
+    
+    // ===================================================================
+    // 2. API Call Function
+    // ===================================================================
+    async function apiCall(action, body = null, method = 'POST') {
+        showLoader();
+        try {
+            const options = {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+            };
+            const url = `api.php?action=${action}`;
+            if (body) {
+                options.method = 'POST';
+                options.body = JSON.stringify(body);
+            }
+            const response = await fetch(url, options);
+            const responseText = await response.text();
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}. Response: ${responseText}`);
+            }
+            const result = JSON.parse(responseText);
+            if (!result.success) {
+                console.error('API Error Payload:', result);
+                throw new Error(result.message || 'خطای ناشناخته از سرور');
+            }
+            return result;
+        } catch (error) {
+            if (error instanceof SyntaxError) {
+                console.error("Server returned non-JSON. This is likely a PHP error. Check Network tab > Response.");
+                alert("خطا: پاسخ نامعتبر از سرور دریافت شد. (احتمالاً خطای PHP). جزئیات را در کنسول F12 ببینید.");
+            } else {
+                console.error('API Call Error:', error);
+                alert(`خطا در ارتباط با سرور: ${error.message}`);
+            }
+            return null;
+        } finally {
+            hideLoader();
+        }
+    }
+
+    // ===================================================================
+    // 3. MAIN RENDER LOGIC (اصلاح‌شده)
+    // ===================================================================
+
+    async function loadAndRender() {
+        const result = await apiCall('getData', null, 'GET'); 
+        if (result && result.data) {
+            fullData = result.data;
+            
+            // (جدید) تنظیم هفته جاری بر اساس داده‌های سرور
+            currentWeekStartDate = getStartDate();
+            
+            document.title = fullData.settings.headerText || "تقویم هفتگی";
+            updateCalendarTitle(); // (جدید) به‌روزرسانی عنوان هدر
+            
+            // رندر کردن بر اساس نمای فعلی
+            renderCurrentView();
+            renderColorLegend();
+        }
+    }
+    
+    function renderCurrentView() {
+        if (currentView === 'grid') {
+            calendarGridContainer.style.display = 'block';
+            calendarListContainer.style.display = 'none';
+            renderGridView();
+        } else {
+            calendarGridContainer.style.display = 'none';
+            calendarListContainer.style.display = 'block';
+            renderListView();
+        }
+    }
+
+    // (جدید) به‌روزرسانی عنوان هدر با بازه تاریخی
+    function updateCalendarTitle() {
+        const start = new Date(currentWeekStartDate.getTime());
+        const end = new Date(start.getTime());
+        end.setDate(start.getDate() + 6);
+
+        const formatter = new Intl.DateTimeFormat('fa-IR-u-nu-latn', { day: 'numeric', month: 'long', year: 'numeric' });
+        
+        // قالب‌بندی بدون سال اگر سال‌ها یکی باشند
+        if (start.getFullYear() === end.getFullYear()) {
+             const startStr = new Intl.DateTimeFormat('fa-IR-u-nu-latn', { day: 'numeric', month: 'long' }).format(start);
+             const endStr = formatter.format(end);
+             calendarTitle.textContent = `(${startStr} - ${endStr})`;
+        } else {
+             calendarTitle.textContent = `(${formatter.format(start)} - ${formatter.format(end)})`;
+        }
+    }
+
+    function renderGridView() {
+        calendarGridContainer.innerHTML = '';
+        const holidays = fullData.holidays || [];
+        
+        if (window.matchMedia("(max-width: 768px)").matches) {
+            document.body.classList.add('mobile-view');
+            createMobileGrid(holidays);
+        } else {
+            document.body.classList.remove('mobile-view');
+            createDesktopGrid(holidays);
+        }
+
+        const allEvents = (fullData.events || []).concat(
+            holidays.map(h => ({
+                id: `h-${h.day}`, title: h.occasion, isAllDay: true, 
+                startDay: h.day, startTime: "00:00", endDay: h.day, endTime: "24:00",
+                color: '#e57373', textColor: 'white', status: 'approved' 
+            }))
+        );
+        
+        renderAllEvents(allEvents);
+        applySmartContent();
+    }
+
+    // (اصلاح‌شده) گرید دسکتاپ برای 24 ساعت
+    function createDesktopGrid(holidays) {
+        calendarGridContainer.innerHTML = `<div class="calendar-grid"><div class="grid-header"><div class="header-corner"></div><div class="header-allday">تمام روز</div><div class="header-timeline"></div></div><div class="grid-body"></div></div>`;
+        const timelineHeader = calendarGridContainer.querySelector('.header-timeline');
+        // 48 ستون برای 24 ساعت
+        timelineHeader.innerHTML = Array.from({ length: 48 }, (_, i) => {
+            const hour = Math.floor(i / 2); // شروع از 0
+            return `<div class="time-label">${i % 2 === 0 ? toPersian(hour) + ':۰۰' : ''}</div>`;
+        }).join('');
+        
+        const gridBody = calendarGridContainer.querySelector('.grid-body');
+        const startDate = getStartDate();
+        for (let j = 0; j < 7; j++) {
+            const currentDate = new Date(startDate.getTime());
+            currentDate.setDate(startDate.getDate() + j);
+            const dateString = new Intl.DateTimeFormat('fa-IR-u-nu-latn', { day: 'numeric', month: 'long' }).format(currentDate);
+            const dayRow = document.createElement('div');
+            dayRow.className = 'day-row';
+            dayRow.setAttribute('data-day-index', j);
+            if (holidays.some(h => h.day === j)) dayRow.classList.add('is-holiday');
+            dayRow.innerHTML = `<div class="day-label"><span>${WEEK_DAYS[j]}</span><span class="date">${toPersian(dateString)}</span></div><div class="all-day-cell"></div><div class="timeline-cell"></div>`;
+            gridBody.appendChild(dayRow);
+        }
+    }
+
+    // (اصلاح‌شده) گرید موبایل برای 24 ساعت
+    function createMobileGrid(holidays) {
+        calendarGridContainer.innerHTML = `<div class="mobile-grid"><div class="mobile-time-axis"></div><div class="mobile-days-container"></div></div>`;
+        const timeAxis = calendarGridContainer.querySelector('.mobile-time-axis');
+        timeAxis.innerHTML += `<div class="time-label-mobile all-day-header">تمام روز</div>`;
+        for (let i = 0; i < 24; i++) { // 24 ساعت
+             timeAxis.innerHTML += `<div class="time-label-mobile">${toPersian(i)}:۰۰</div>`; 
+        }
+        
+        const daysContainer = calendarGridContainer.querySelector('.mobile-days-container');
+        const startDate = getStartDate();
+        for (let j = 0; j < 7; j++) {
+            const currentDate = new Date(startDate.getTime());
+            currentDate.setDate(startDate.getDate() + j);
+            const dateString = new Intl.DateTimeFormat('fa-IR-u-nu-latn', { day: 'numeric', month: 'long' }).format(currentDate);
+            const dayColumn = document.createElement('div');
+            dayColumn.className = 'day-column';
+            dayColumn.setAttribute('data-day-index', j);
+            if (holidays.some(h => h.day === j)) dayColumn.classList.add('is-holiday');
+            dayColumn.innerHTML = `<div class="day-label"><span>${WEEK_DAYS[j]}</span><span class="date">${toPersian(dateString)}</span></div><div class="all-day-cell"></div><div class="timeline-cell"></div>`;
+            daysContainer.appendChild(dayColumn);
+        }
+    }
+
+    // (اصلاح‌شده) منطق رندر برای پشتیبانی از چند روزه
+    function renderAllEvents(events) {
+        let allDayEventsByDay = Array(7).fill(null).map(() => []);
+        let timedEventsByDay = Array(7).fill(null).map(() => []);
+        
+        // (جدید) پردازش و تکه‌تکه کردن رویدادها
+        for (const event of events) {
+            for (let day = event.startDay; day <= event.endDay; day++) {
+                if (day < 0 || day > 6) continue; // خارج از هفته فعلی
+
+                const chunk = { ...event, day: day }; // کپی کردن رویداد
+                
+                // تنظیمات چند روزه
+                chunk.isMultiDayPart = (event.startDay !== event.endDay);
+                chunk.isStart = (day === event.startDay);
+                chunk.isEnd = (day === event.endDay);
+                
+                // تنظیم زمان‌های شروع و پایان برای این "تکه"
+                chunk.from = (chunk.isStart) ? event.startTime : "00:00";
+                chunk.to = (chunk.isEnd) ? event.endTime : "24:00";
+                
+                if(event.isAllDay) {
+                    allDayEventsByDay[day].push(chunk);
+                } else {
+                    timedEventsByDay[day].push(chunk);
+                }
+            }
+        }
+        
+        // رندر کردن تکه‌ها در روزهای مربوطه
+        for (let day = 0; day < 7; day++) {
+            const dayContainer = document.querySelector(`[data-day-index="${day}"]`);
+            if (!dayContainer) continue;
+            
+            const allDayCell = dayContainer.querySelector('.all-day-cell');
+            const allDayEvents = allDayEventsByDay[day];
+            if (allDayEvents.length > 0) {
+                allDayCell.style.setProperty('--event-count', allDayEvents.length);
+                allDayEvents.forEach(event => createEventDiv(event, allDayCell, true));
+            }
+            
+            const timelineCell = dayContainer.querySelector('.timeline-cell');
+            const timedEvents = timedEventsByDay[day].sort((a, b) => timeToMinutes(a.from) - timeToMinutes(b.from));
+            if (timedEvents.length > 0) processAndRenderTimedEvents(timedEvents, timelineCell);
+        }
+    }
+
+    function createEventDiv(event, container, isAllDay = false) {
+        const eventDiv = document.createElement('div');
+        eventDiv.className = isAllDay ? 'event-allday' : 'event';
+        eventDiv.classList.add(`status-${event.status || 'approved'}`);
+
+        if (event.status === 'approved') {
+            eventDiv.style.backgroundColor = event.color;
+            eventDiv.style.color = event.textColor || 'white';
+        }
+        
+        // (جدید) اضافه کردن دیتا برای استایلینگ
+        if (event.isMultiDayPart) {
+            eventDiv.dataset.ismultiday = true;
+            if (event.isStart) eventDiv.dataset.isstart = true;
+            if (event.isEnd) eventDiv.dataset.isend = true;
+        }
+        
+        let isLocked = false;
+        if (CURRENT_USER.role === 'proposer' || CURRENT_USER.role === 'viewer') {
+            if(event.status === 'approved' && event.proposerId !== CURRENT_USER.id) {
+                isLocked = true;
+            }
+        }
+        if (CURRENT_USER.role === 'viewer' && event.proposerId) {
+            isLocked = true;
+        }
+        if(isLocked) eventDiv.classList.add('event-locked');
+        
+        eventDiv.dataset.event = JSON.stringify(event);
+        eventDiv.dataset.locked = isLocked;
+        
+        container.appendChild(eventDiv);
+        return eventDiv;
+    }
+
+    // (اصلاح‌شده) منطق رندر برای 24 ساعت
+    function processAndRenderTimedEvents(dayEvents, timelineCell) {
+        const isMobile = document.body.classList.contains('mobile-view');
+        dayEvents.forEach(event => { event.start = timeToMinutes(event.from); event.end = timeToMinutes(event.to); });
+        
+        let i = 0;
+        while (i < dayEvents.length) {
+            let overlappingGroup = [dayEvents[i]];
+            let maxEnd = dayEvents[i].end;
+            for (let j = i + 1; j < dayEvents.length; j++) {
+                if (dayEvents[j].start < maxEnd) {
+                    overlappingGroup.push(dayEvents[j]);
+                    if (dayEvents[j].end > maxEnd) maxEnd = dayEvents[j].end;
+                } else break;
+            }
+            
+            const lanes = [];
+            overlappingGroup.sort((a,b) => a.start - b.start).forEach(event => {
+                let placed = false;
+                for (const lane of lanes) { if (event.start >= lane[lane.length - 1].end) { lane.push(event); placed = true; break; } }
+                if (!placed) lanes.push([event]);
+            });
+            
+            const totalLanes = lanes.length;
+            lanes.forEach((lane, laneIndex) => {
+                lane.forEach(event => {
+                    const eventWrapper = document.createElement('div'); eventWrapper.className = 'event-wrapper';
+                    const totalMinutesInView = 24 * 60; // (جدید) 24 ساعت
+                    const startOffsetMinutes = event.start; // (جدید) شروع از 0
+                    const durationMinutes = event.end - event.start;
+                    
+                    if (isMobile) {
+                        eventWrapper.style.top = `${(startOffsetMinutes / totalMinutesInView) * 100}%`; eventWrapper.style.height = `${(durationMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.left = `${(laneIndex / totalLanes) * 100}%`; eventWrapper.style.width = `${100 / totalLanes}%`;
+                    } else {
+                        eventWrapper.style.right = `${(startOffsetMinutes / totalMinutesInView) * 100}%`; eventWrapper.style.width = `${(durationMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.top = `${(laneIndex / totalLanes) * 100}%`; eventWrapper.style.height = `${100 / totalLanes}%`;
+                    }
+                    createEventDiv(event, eventWrapper, false);
+                });
+            });
+            i += overlappingGroup.length;
+        }
+    }
+
+    function applySmartContent() {
+        document.querySelectorAll('.all-day-cell .event-allday').forEach(eventDiv => {
+            const event = JSON.parse(eventDiv.dataset.event);
+            const availableHeight = eventDiv.clientHeight;
+            let content = `<div class="event-title">${event.isStart ? event.title : ''}</div>`; // فقط در روز شروع عنوان را نشان بده
+            if (availableHeight >= 45) {
+                content = `<div class="event-title">${event.isStart ? event.title : ''}</div>
+                           <div class="event-meta">${event.isStart ? (event.by || '-') : ''}</div>
+                           <div class="event-meta">${event.isStart ? (event.for || '-') : ''}</div>`;
+            }
+            eventDiv.innerHTML = content + getDepartmentLabel(event);
+            if (availableHeight < 25) eventDiv.classList.add('event-ultra-condensed');
+        });
+        
+        document.querySelectorAll('.event-wrapper .event').forEach(eventDiv => {
+            const event = JSON.parse(eventDiv.dataset.event);
+            const eventWidth = eventDiv.clientWidth; const eventHeight = eventDiv.clientHeight;
+            let content = `<div class="event-title">${event.isStart ? event.title : ''}</div>
+                           <div class="event-meta">${event.isStart ? (event.by || '-') : ''}</div>
+                           <div class="event-meta">${event.isStart ? (event.for || '-') : ''}</div>`;
+            if (eventWidth < 90 || eventHeight < 45) {
+                content = `<div class="event-title">${event.isStart ? event.title : ''}</div>`;
+            }
+            // اگر تکه‌ای از وسط باشد، فقط رنگ را نشان بده
+            if(event.isMultiDayPart && !event.isStart) {
+                content = '';
+            }
+            
+            eventDiv.innerHTML = content + getDepartmentLabel(event);
+            if (eventWidth < 50 || eventHeight < 25) eventDiv.classList.add('event-ultra-condensed');
+        });
+    }
+    
+    function getDepartmentLabel(event) {
+        if (!event.departmentId || !event.isStart) return ''; // فقط در روز شروع لیبل را نشان بده
+        const shouldShow = (CURRENT_USER.role === 'manager' || CURRENT_USER.role === 'evaluator') || 
+                           (event.departmentId !== CURRENT_USER.departmentId);
+        if (shouldShow) {
+            const dept = fullData.departments.find(d => d.id === event.departmentId);
+            if (dept) return `<div class="event-dept">${dept.name}</div>`;
+        }
+        return '';
+    }
+
+    // (اصلاح‌شده) دریافت تاریخ شروع
+    function getStartDate() {
+        const gregorianDateStr = fullData.settings.weekStartDate;
+        if (gregorianDateStr && /^\d{4}-\d{2}-\d{2}$/.test(gregorianDateStr)) {
+            const [year, month, day] = gregorianDateStr.split('-').map(Number);
+            return new Date(year, month - 1, day);
+        }
+        // Fallback to THIS week's Saturday
+        const today = new Date();
+        const firstSaturday = new Date(today.setDate(today.getDate() - (today.getDay() + 1) % 7));
+        firstSaturday.setHours(0, 0, 0, 0);
+        return firstSaturday;
+    }
+    
+    function renderColorLegend() {
+        let html = '<h4>راهنمای دپارتمان‌ها</h4><ul>';
+        (fullData.departments || []).forEach(dept => {
+            html += `<li><span class="legend-swatch" style="background-color: ${dept.color}"></span>${dept.name}</li>`;
+        });
+        html += '</ul>';
+        legendPopup.innerHTML = html;
+    }
+    
+    // (جدید) رندر نمای لیستی
+    function renderListView() {
+        calendarListContainer.innerHTML = '';
+        const events = (fullData.events || []).filter(e => e.status === 'approved' || e.status === 'pending');
+        
+        events.sort((a, b) => {
+            if (a.startDay !== b.startDay) return a.startDay - b.startDay;
+            return timeToMinutes(a.startTime) - timeToMinutes(b.startTime);
+        });
+
+        if (events.length === 0) {
+            calendarListContainer.innerHTML = '<h2>نمای لیستی</h2><p>هیچ رویدادی برای این هفته یافت نشد.</p>';
+            return;
+        }
+
+        let currentDay = -1;
+        let html = '';
+        
+        events.forEach(event => {
+            if (event.startDay !== currentDay) {
+                currentDay = event.startDay;
+                html += `<h2>${WEEK_DAYS[currentDay]}</h2>`;
+            }
+            
+            const time = event.isAllDay 
+                ? `(تمام روز ${WEEK_DAYS[event.startDay]} تا ${WEEK_DAYS[event.endDay]})`
+                : `${toPersian(event.startTime)} (${WEEK_DAYS[event.startDay]}) الی ${toPersian(event.endTime)} (${WEEK_DAYS[event.endDay]})`;
+                
+            const dept = fullData.departments.find(d => d.id === event.departmentId);
+            const statusClass = `status-${event.status}`;
+            
+            html += `
+                <div class="list-view-item ${statusClass}">
+                    <div class="list-view-time">
+                        ${time}
+                        <div class="list-day">${dept ? dept.name : 'عمومی'}</div>
+                    </div>
+                    <div class="list-view-details">
+                        <h4>${event.title} ${event.status === 'pending' ? '(در انتظار)' : ''}</h4>
+                        <span>مجری: ${event.by || '-'}</span>
+                        <span>مخاطب: ${event.for || '-'}</span>
+                    </div>
+                    <div class="list-view-goal">
+                        <h5>هدف:</h5>
+                        <p>${event.goal || '(ثبت نشده)'}</p>
+                    </div>
+                </div>
+            `;
+        });
+        
+        calendarListContainer.innerHTML = html;
+    }
+
+    // ===================================================================
+    // 4. EVENT MODAL LOGIC (اصلاح‌شده برای فیلدهای جدید)
+    // ===================================================================
+
+    function openEventModal(event = null) {
+        eventForm.reset();
+        approvalActions.style.display = 'none';
+        deleteEventBtn.style.display = 'none';
+        saveEventBtn.textContent = 'ذخیره';
+        saveEventBtn.style.display = 'block';
+        managerColorInputs.style.display = 'none';
+        eventGoalGroup.style.display = 'block';
+        
+        eventForm.querySelectorAll('input, select, textarea').forEach(el => el.disabled = false);
+        
+        if (event) {
+            // --- حالت ویرایش / بررسی ---
+            eventIdInput.value = event.id;
+            eventTitleInput.value = event.title;
+            eventByInput.value = event.by || '';
+            eventForInput.value = event.for || '';
+            eventGoalInput.value = event.goal || '';
+            isAllDayCheckbox.checked = event.isAllDay;
+            // (جدید) تنظیم فیلدهای شروع و پایان
+            startDaySelect.value = event.startDay;
+            startTimeInput.value = event.startTime || '09:00';
+            endDaySelect.value = event.endDay;
+            endTimeInput.value = event.endTime || '10:00';
+            
+            const canApprove = CURRENT_USER.role === 'manager' || CURRENT_USER.role === 'evaluator';
+            const isOwner = event.proposerId === CURRENT_USER.id;
+            const isApproved = event.status === 'approved';
+
+            if (canApprove) {
+                eventModalTitle.textContent = 'ویرایش / تایید رویداد';
+                if (event.status === 'pending') approvalActions.style.display = 'flex';
+                deleteEventBtn.style.display = 'block';
+            } else { 
+                eventModalTitle.textContent = 'مشاهده / ویرایش پیشنهاد';
+                if (!isOwner || isApproved) {
+                    eventForm.querySelectorAll('input, select, textarea').forEach(el => el.disabled = true);
+                    saveEventBtn.style.display = 'none';
+                }
+                if (isOwner && !isApproved) {
+                    deleteEventBtn.style.display = 'block';
+                }
+            }
+            if (CURRENT_USER.role === 'proposer' || CURRENT_USER.role === 'viewer') {
+                eventGoalGroup.style.display = 'none';
+            }
+            
+        } else {
+            // --- حالت افزودن جدید ---
+            eventIdInput.value = '';
+            eventGoalInput.value = '';
+            startDaySelect.value = 0;
+            startTimeInput.value = '09:00';
+            endDaySelect.value = 0;
+            endTimeInput.value = '10:00';
+            
+            if (CURRENT_USER.role === 'manager') {
+                eventModalTitle.textContent = 'افزودن رویداد مستقیم';
+                managerColorInputs.style.display = 'block';
+                eventGoalGroup.style.display = 'block';
+            } else if (CURRENT_USER.role === 'evaluator') {
+                eventModalTitle.textContent = 'افزودن رویداد (ارزیاب)';
+                eventGoalGroup.style.display = 'block';
+            } else { // Proposer
+                eventModalTitle.textContent = 'پیشنهاد رویداد جدید';
+                eventGoalGroup.style.display = 'block';
+            }
+        }
+        
+        // همگام‌سازی چک‌باکس تمام روز
+        isAllDayCheckbox.dispatchEvent(new Event('change'));
+        eventModal.style.display = 'flex';
+    }
+
+    function closeEventModal() {
+        eventModal.style.display = 'none';
+    }
+
+    async function handleEventFormSubmit(e) {
+        e.preventDefault();
+        
+        const eventData = {
+            id: eventIdInput.value || null,
+            title: eventTitleInput.value.trim(),
+            by: eventByInput.value.trim(),
+            for: eventForInput.value.trim(),
+            goal: eventGoalInput.value.trim(),
+            isAllDay: isAllDayCheckbox.checked,
+            startDay: +startDaySelect.value,
+            startTime: startTimeInput.value,
+            endDay: +endDaySelect.value,
+            endTime: endTimeInput.value,
+        };
+        
+        if (CURRENT_USER.role === 'manager' && !eventData.id) {
+            eventData.color = document.getElementById('eventBgColor').value;
+            eventData.textColor = document.getElementById('eventTextColor').value;
+        }
+
+        const result = await apiCall('saveEvent', { event: eventData }, 'POST');
+        if (result) {
+            alert(result.message);
+            closeEventModal();
+            loadAndRender(); // Reload calendar
+        }
+    }
+    
+    async function handleEventStatusUpdate(status) {
+        const eventId = eventIdInput.value;
+        if (!eventId) return;
+        const result = await apiCall('updateEventStatus', { id: eventId, status: status }, 'POST');
+        if (result) {
+            alert(result.message);
+            closeEventModal();
+            loadAndRender();
+        }
+    }
+
+    async function handleEventDelete() {
+        const eventId = eventIdInput.value;
+        if (!eventId) return;
+        if (confirm('آیا از حذف این رویداد مطمئن هستید؟')) {
+            const result = await apiCall('deleteEvent', { id: eventId }, 'POST');
+            if (result) {
+                alert(result.message);
+                closeEventModal();
+                loadAndRender();
+            }
+        }
+    }
+    
+    // ===================================================================
+    // 5. SETTINGS MODAL (اصلاح‌شده برای قالب تاریخ)
+    // ===================================================================
+    
+    function generateWeeks() {
+        weekSelector.innerHTML = '';
+        const today = new Date();
+        const currentYear = today.getFullYear();
+        
+        for(let year = currentYear - 1; year <= currentYear + 1; year++) {
+            const yearStart = new Date(year, 0, 1);
+            let firstSaturday = new Date(yearStart);
+            firstSaturday.setDate(yearStart.getDate() - (yearStart.getDay() + 1) % 7);
+
+            for (let i = 0; i < 53; i++) {
+                const weekStart = new Date(firstSaturday);
+                weekStart.setDate(firstSaturday.getDate() + (i * 7));
+                if (weekStart.getFullYear() > year) break;
+                
+                const weekEnd = new Date(weekStart);
+                weekEnd.setDate(weekEnd.getDate() + 6);
+                
+                const option = document.createElement('option');
+                const gregorianStartDate = formatDate(weekStart);
+                option.value = gregorianStartDate;
+                
+                const startStr = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(weekStart);
+                const endStr = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(weekEnd);
+                option.textContent = `(${startStr} - ${endStr}, ${toPersian(year)})`; // (جدید) قالب تاریخ
+                
+                weekSelector.appendChild(option);
+            }
+        }
+    }
+    
+    function openSettingsModal() {
+        generateWeeks();
+        mainHeaderInput.value = fullData.settings.headerText;
+        let selectedWeek = fullData.settings.weekStartDate;
+        if (!selectedWeek) {
+            selectedWeek = formatDate(getStartDate()); // استفاده از تاریخ شروع فعلی
+        }
+        weekSelector.value = selectedWeek;
+        if (!weekSelector.value) {
+             const option = document.createElement('option');
+             option.value = selectedWeek;
+             option.textContent = `هفته ذخیره شده (${selectedWeek})`;
+             weekSelector.prepend(option);
+             weekSelector.value = selectedWeek;
+        }
+        settingsModal.style.display = 'flex';
+    }
+    
+    async function handleSettingsSave() {
+        const newSettings = {
+            headerText: mainHeaderInput.value,
+            weekStartDate: weekSelector.value
+        };
+        const result = await apiCall('saveSettings', newSettings, 'POST');
+        if (result) {
+            alert(result.message);
+            settingsModal.style.display = 'none';
+            loadAndRender(); // Reload all
+        }
+    }
+
+    // ===================================================================
+    // 6. DEPARTMENTS MODAL (بدون تغییر)
+    // ===================================================================
+    function renderDeptsEditor() {
+        deptsListEditor.innerHTML = '';
+        fullData.departments.forEach(dept => {
+            deptsListEditor.appendChild(createDeptEditorRow(dept));
+        });
+    }
+    function createDeptEditorRow(dept = null) {
+        const isNew = dept === null;
+        const deptId = isNew ? `new_${Date.now()}` : dept.id;
+        const item = document.createElement('div');
+        item.className = 'dept-item';
+        item.dataset.id = deptId;
+        item.innerHTML = `
+            <input type="text" class="dept-name" value="${isNew ? '' : dept.name}" placeholder="نام دپارتمان">
+            <input type="color" class="dept-color" value="${isNew ? '#c8c8c8' : dept.color}">
+            <button class="danger-btn small-btn remove-dept-btn">حذف</button>
+        `;
+        item.querySelector('.remove-dept-btn').addEventListener('click', () => {
+            if (confirm(`آیا از حذف دپارتمان ${isNew ? 'جدید' : dept.name} مطمئن هستید؟`)) {
+                item.remove();
+            }
+        });
+        return item;
+    }
+    function openDeptsModal() {
+        renderDeptsEditor();
+        deptsModal.style.display = 'flex';
+    }
+    function addNewDeptEditorRow() {
+        deptsListEditor.appendChild(createDeptEditorRow(null));
+    }
+    async function handleDeptsSave() {
+        const newDepts = [];
+        deptsListEditor.querySelectorAll('.dept-item').forEach(item => {
+            const id = item.dataset.id;
+            const name = item.querySelector('.dept-name').value.trim();
+            const color = item.querySelector('.dept-color').value;
+            if (name) { 
+                newDepts.push({
+                    id: id.startsWith('new_') ? `d_${Date.now()}` : id, 
+                    name: name,
+                    color: color
+                });
+            }
+        });
+        const result = await apiCall('manageDepartments', { departments: newDepts }, 'POST');
+         if (result) {
+            alert(result.message);
+            fullData.departments = newDepts;
+            deptsModal.style.display = 'none';
+            renderColorLegend();
+        }
+    }
+    
+    // ===================================================================
+    // 7. USERS MODAL (بدون تغییر)
+    // ===================================================================
+    function renderUsersEditor() {
+        usersListEditor.innerHTML = '';
+        fullData.users.forEach(user => {
+            usersListEditor.appendChild(createUserEditorRow(user));
+        });
+    }
+    function createUserEditorRow(user = null) {
+        const isNew = user === null;
+        const userId = isNew ? `new_${Date.now()}` : user.id;
+        const item = document.createElement('form'); 
+        item.className = 'user-item';
+        item.dataset.id = userId;
+        const perms = isNew ? {} : user.permissions;
+        const deptOptions = fullData.departments.map(d => 
+            `<option value="${d.id}" ${!isNew && user.departmentId === d.id ? 'selected' : ''}>${d.name}</option>`
+        ).join('');
+        const viewAllDeptsChecked = perms.view_all_depts ? 'checked' : '';
+        let deptCheckboxes = fullData.departments.map(d => `
+            <label>
+                <input type="checkbox" class="perm-dept" value="${d.id}" ${perms.view_depts?.includes(d.id) ? 'checked' : ''}>
+                ${d.name}
+            </label>
+        `).join('');
+        const viewAllUsersChecked = perms.view_all_users ? 'checked' : '';
+        let userCheckboxes = fullData.users.filter(u => u.id !== userId).map(u => `
+             <label>
+                <input type="checkbox" class="perm-user" value="${u.id}" ${perms.view_users?.includes(u.id) ? 'checked' : ''}>
+                ${u.displayName} (${u.username})
+            </label>
+        `).join('');
+        item.innerHTML = `
+            <input type="text" class="user-username" value="${isNew ? '' : user.username}" placeholder="نام کاربری (لاگین)" required>
+            <input type="text" class="user-displayname" value="${isNew ? '' : user.displayName}" placeholder="نام نمایشی" required>
+            <input type="text" class="user-password" placeholder="${isNew ? 'رمز عبور (الزامی)' : 'رمز عبور (خالی بگذارید)'}" ${isNew ? 'required' : ''}>
+            <select class="user-role">
+                <option value="proposer" ${!isNew && user.role === 'proposer' ? 'selected' : ''}>پیشنهاددهنده</option>
+                <option value="evaluator" ${!isNew && user.role === 'evaluator' ? 'selected' : ''}>ارزیاب</option>
+                <option value="viewer" ${!isNew && user.role === 'viewer' ? 'selected' : ''}>بیننده</option>
+                <option value="manager" ${!isNew && user.role === 'manager' ? 'selected' : ''}>مدیر</option>
+            </select>
+            <div class="user-item-depts" style="grid-column: 1 / -1; margin-top: 1rem;">
+                <label><b>دپارتمان اصلی:</b></label>
+                <select class="user-department">
+                    <option value="">(هیچکدام)</option>
+                    ${deptOptions}
+                </select>
+            </div>
+            <div class="user-item-permissions">
+                <div class="permission-group">
+                    <h5>دسترسی مشاهده دپارتمان‌ها</h5>
+                    <label><input type="checkbox" class="perm-all-depts" ${viewAllDeptsChecked}> <b>(مشاهده همه)</b></label>
+                    <div class="permission-group-items">${deptCheckboxes}</div>
+                </div>
+                <div class="permission-group">
+                    <h5>دسترسی مشاهده کاربران (فقط رویدادهای تایید شده)</h5>
+                    <label><input type="checkbox" class="perm-all-users" ${viewAllUsersChecked}> <b>(مشاهده همه)</b></label>
+                    <div class="permission-group-items">${userCheckboxes}</div>
+                </div>
+            </div>
+            <div class="user-item-actions">
+                <button type="button" class="danger-btn small-btn remove-user-btn">حذف</button>
+                <button type="submit" class="secondary-btn small-btn save-user-btn">ذخیره</button>
+            </div>
+        `;
+        item.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const id = item.dataset.id;
+            const isNew = id.startsWith('new_');
+            const password = item.querySelector('.user-password').value;
+            const userData = {
+                id: isNew ? null : id,
+                username: item.querySelector('.user-username').value.trim(),
+                displayName: item.querySelector('.user-displayname').value.trim(),
+                password: password || null,
+                role: item.querySelector('.user-role').value,
+                departmentId: item.querySelector('.user-department').value || null,
+                permissions: {
+                    view_all_depts: item.querySelector('.perm-all-depts').checked,
+                    view_depts: Array.from(item.querySelectorAll('.perm-dept:checked')).map(el => el.value),
+                    view_all_users: item.querySelector('.perm-all-users').checked,
+                    view_users: Array.from(item.querySelectorAll('.perm-user:checked')).map(el => el.value),
+                }
+            };
+            const result = await apiCall('manageUsers', { sub_action: 'save', user: userData }, 'POST');
+            if (result) {
+                alert(result.message);
+                fullData.users = result.data;
+                renderUsersEditor();
+            }
+        });
+        const deleteBtn = item.querySelector('.remove-user-btn');
+        deleteBtn.addEventListener('click', async (e) => {
+             e.preventDefault();
+             const id = item.dataset.id;
+             const username = item.querySelector('.user-username').value || 'جدید';
+             if (confirm(`آیا از حذف کاربر ${username} مطمئن هستید؟`)) {
+                 if(id.startsWith('new_')) {
+                     item.remove(); 
+                 } else {
+                     const result = await apiCall('manageUsers', { sub_action: 'delete', user: { id: id } }, 'POST');
+                     if(result) {
+                        alert(result.message);
+                        fullData.users = result.data;
+                        renderUsersEditor();
+                     }
+                 }
+             }
+        });
+        if (isNew) deleteBtn.style.display = 'none';
+        return item;
+    }
+    function openUsersModal() {
+        renderUsersEditor();
+        usersModal.style.display = 'flex';
+    }
+    function addNewUserEditorRow() {
+        usersListEditor.appendChild(createUserEditorRow(null));
+    }
+    
+    // ===================================================================
+    // 8. ISSUE REPORTING MODALS (بدون تغییر)
+    // ===================================================================
+    async function handleIssueSend() {
+        const text = issueTextInput.value.trim();
+        if (!text) {
+            alert('لطفاً متن پیام را وارد کنید.');
+            return;
+        }
+        const result = await apiCall('reportIssue', { text: text }, 'POST');
+        if (result) {
+            alert(result.message);
+            issueModal.style.display = 'none';
+            issueTextInput.value = '';
+        }
+    }
+    async function openViewIssuesModal() {
+        const result = await apiCall('getIssues', null, 'GET');
+        if (result && result.data) {
+            issuesListContainer.innerHTML = '';
+            if (result.data.length === 0) {
+                issuesListContainer.innerHTML = '<p>هیچ پیامی یافت نشد.</p>';
+            }
+            result.data.forEach(issue => {
+                const item = document.createElement('div');
+                item.className = 'issue-item';
+                const date = new Intl.DateTimeFormat('fa-IR', { dateStyle: 'full', timeStyle: 'short' }).format(new Date(issue.timestamp));
+                item.innerHTML = `
+                    <p>${issue.text}</p>
+                    <div class="issue-meta">
+                        <strong>توسط:</strong> ${issue.userName} | <strong>در:</strong> ${date}
+                    </div>
+                `;
+                issuesListContainer.appendChild(item);
+            });
+            viewIssuesModal.style.display = 'flex';
+        }
+    }
+
+    // ===================================================================
+    // 9. (جدید) FAB Menu Logic
+    // ===================================================================
+    function setupFabMenu() {
+        fabMenu.innerHTML = ''; // پاک کردن منو
+        const role = CURRENT_USER.role;
+        
+        let actions = [];
+        
+        // دکمه‌هایی که همه دارند
+        actions.push({ id: 'fab-action-issue', class: 'action-issue', icon: '🐞', title: 'رفع مشکل' });
+
+        // دکمه‌های افزودن
+        if (role === 'manager' || role === 'proposer' || role === 'evaluator') {
+            actions.push({ id: 'fab-action-add', class: 'action-add', icon: '➕', title: 'افزودن رویداد' });
+        }
+        
+        // دکمه‌های مدیر
+        if (role === 'manager') {
+            actions.push({ id: 'fab-action-view-issue', class: 'action-view-issue', icon: '📩', title: 'مشاهده مشکلات' });
+            actions.push({ id: 'fab-action-settings', class: 'action-admin', icon: '⚙️', title: 'تنظیمات اصلی' });
+            actions.push({ id: 'fab-action-users', class: 'action-admin', icon: '👥', title: 'مدیریت کاربران' });
+            actions.push({ id: 'fab-action-depts', class: 'action-admin', icon: '🎨', title: 'مدیریت دپارتمان‌ها' });
+        }
+        
+        // ساخت دکمه‌ها در DOM
+        actions.forEach(action => {
+            const btn = document.createElement('button');
+            btn.id = action.id;
+            btn.className = `fab-action ${action.class}`;
+            btn.title = action.title;
+            btn.innerHTML = action.icon;
+            fabMenu.appendChild(btn);
+            
+            // اتصال شنونده رویداد
+            btn.addEventListener('click', () => {
+                switch(action.id) {
+                    case 'fab-action-issue': openIssueModal(); break;
+                    case 'fab-action-add': openEventModal(null); break;
+                    case 'fab-action-view-issue': openViewIssuesModal(); break;
+                    case 'fab-action-settings': openSettingsModal(); break;
+                    case 'fab-action-users': openUsersModal(); break;
+                    case 'fab-action-depts': openDeptsModal(); break;
+                }
+                // بستن منو پس از کلیک
+                fabMainBtn.classList.remove('active');
+                fabMenu.classList.remove('active');
+            });
+        });
+    }
+
+    // ===================================================================
+    // 10. EVENT LISTENERS (اصلاح‌شده)
+    // ===================================================================
+    function setupEventListeners() {
+        
+        // --- Main Calendar Click (Event Delegation) ---
+        calendarGridContainer.addEventListener('click', (e) => {
+            const eventDiv = e.target.closest('.event, .event-allday');
+            if (!eventDiv) return;
+            const isLocked = eventDiv.dataset.locked === 'true';
+            if (isLocked) return;
+            const event = JSON.parse(eventDiv.dataset.event);
+            if (event.id.startsWith('h-')) return;
+            openEventModal(event);
+        });
+        
+        // --- (جدید) Week Navigation ---
+        prevWeekBtn.addEventListener('click', () => navigateWeek(-7));
+        nextWeekBtn.addEventListener('click', () => navigateWeek(7));
+        
+        async function navigateWeek(days) {
+            currentWeekStartDate.setDate(currentWeekStartDate.getDate() + days);
+            const newStartDateString = formatDate(currentWeekStartDate);
+            
+            // ذخیره هفته جدید در سرور
+            const result = await apiCall('saveSettings', { weekStartDate: newStartDateString }, 'POST');
+            if (result) {
+                loadAndRender(); // بارگذاری مجدد کامل داده‌ها
+            } else {
+                // برگرداندن تاریخ در صورت خطا
+                currentWeekStartDate.setDate(currentWeekStartDate.getDate() - days);
+            }
+        }
+
+        // --- (جدید) FAB Menu Toggle ---
+        fabMainBtn.addEventListener('click', () => {
+            fabMainBtn.classList.toggle('active');
+            fabMenu.classList.toggle('active');
+        });
+
+        // --- View Toggle Button ---
+        if (viewToggleBtn) {
+            viewToggleBtn.addEventListener('click', () => {
+                if (currentView === 'grid') {
+                    currentView = 'list';
+                    viewToggleBtn.textContent = 'نمای جدولی';
+                } else {
+                    currentView = 'grid';
+                    viewToggleBtn.textContent = 'نمای لیستی';
+                }
+                renderCurrentView();
+            });
+        }
+
+        // --- Event Modal ---
+        isAllDayCheckbox.addEventListener('change', () => {
+            const isChecked = isAllDayCheckbox.checked;
+            startTimeInput.disabled = isChecked;
+            endTimeInput.disabled = isChecked;
+            if(isChecked) {
+                startTimeInput.value = "00:00";
+                endTimeInput.value = "24:00";
+            }
+        });
+        cancelEventBtn.addEventListener('click', closeEventModal);
+        eventForm.addEventListener('submit', handleEventFormSubmit);
+        approveEventBtn.addEventListener('click', () => handleEventStatusUpdate('approved'));
+        rejectEventBtn.addEventListener('click', () => handleEventStatusUpdate('rejected'));
+        deleteEventBtn.addEventListener('click', handleEventDelete);
+
+        // --- Color Legend ---
+        legendBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            legendPopup.style.display = legendPopup.style.display === 'block' ? 'none' : 'block';
+        });
+        document.addEventListener('click', (e) => {
+             if (!legendPopup.contains(e.target) && e.target !== legendBtn) {
+                 legendPopup.style.display = 'none';
+             }
+        });
+
+        // --- Manager Modals (Listeners are now inside setupFabMenu) ---
+        // (جدید) اما دکمه‌های ذخیره و انصراف آن‌ها هنوز نیاز به شنونده دارند
+        const saveSettingsBtn = document.getElementById('save-settings-btn');
+        if (saveSettingsBtn) {
+            saveSettingsBtn.addEventListener('click', handleSettingsSave);
+            document.getElementById('cancel-settings-btn').addEventListener('click', () => settingsModal.style.display = 'none');
+        }
+        const saveDeptsBtn = document.getElementById('save-depts-btn');
+        if (saveDeptsBtn) {
+            saveDeptsBtn.addEventListener('click', handleDeptsSave);
+            document.getElementById('add-new-dept-btn').addEventListener('click', addNewDeptEditorRow);
+            document.getElementById('cancel-depts-btn').addEventListener('click', () => deptsModal.style.display = 'none');
+        }
+        const usersBtn = document.getElementById('manage-users-btn');
+        if (usersBtn) { // فقط برای اطمینان از وجود مودال
+            document.getElementById('add-new-user-btn').addEventListener('click', addNewUserEditorRow);
+            document.getElementById('cancel-users-btn').addEventListener('click', () => usersModal.style.display = 'none');
+        }
+
+        // --- Issue Modals Listeners ---
+        document.getElementById('cancel-issue-btn').addEventListener('click', () => {
+            issueModal.style.display = 'none';
+        });
+        document.getElementById('send-issue-btn').addEventListener('click', handleIssueSend);
+        if(viewIssuesModal) {
+             document.getElementById('close-issues-btn').addEventListener('click', () => {
+                viewIssuesModal.style.display = 'none';
+            });
+        }
+
+        // --- Time Picker (Simplified) ---
+        startTimeInput.addEventListener('click', () => alert('Time Picker UI should open'));
+        endTimeInput.addEventListener('click', () => alert('Time Picker UI should open'));
+
+        // --- Resize ---
+        let resizeTimer;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(renderGridView, 100);
+        });
+    }
+
+    // --- Initial Load ---
+    setupEventListeners();
+    setupFabMenu(); // (جدید) منوی دایره‌ای را بساز
+    loadAndRender(); // Start the app
+});
+
+ext.py
+
+import os
+
+# --- تنظیمات ---
+# پوشه‌ای که می‌خواهید اسکن کنید (نقطه '.' به معنای پوشه فعلی است)
+ROOT_DIRECTORY = '.' 
+
+# نام فایل نهایی که همه‌چیز در آن ذخیره می‌شود
+OUTPUT_FILE = 'text.txt'
+
+# لیست پوشه‌هایی که باید نادیده گرفته شوند
+IGNORED_DIRECTORIES = {
+    '.git', 
+    '.gitignore', 
+    '.vscode', 
+    'node_modules', 
+    '__pycache__', 
+    '.venv',
+    'venv',
+    '__pycache__',
+    'dist',
+    'build',
+    '.next',
+    '.node_modules',
+    'migrations'
+}
+
+# لیست پسوند فایل‌هایی که باید نادیده گرفته شوند (فایل‌های باینری، عکس و...)
+IGNORED_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg',
+    '.zip', '.rar', '.gz', '.tar',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx',
+    '.exe', '.dll', '.so', '.o',
+    '.pyc',
+    '.mp4', '.mkv', '.mov', '.mp3',
+    '.lock'
+}
+# --- پایان تنظیمات ---
+
+def get_all_files_content():
+    # مسیر کامل فایل خروجی را می‌سازیم تا بعداً بتوانیم آن را نادیده بگیریم
+    try:
+        abs_output_path = os.path.abspath(os.path.join(ROOT_DIRECTORY, OUTPUT_FILE))
+    except Exception as e:
+        print(f"Error getting absolute path for output file: {e}")
+        return
+
+    print(f"Writing project content to {OUTPUT_FILE}...")
+
+    # فایل خروجی را در حالت 'write' با انکودینگ 'utf-8' باز می‌کنیم
+    try:
+        with open(OUTPUT_FILE, 'w', encoding='utf-8') as outfile:
+            # os.walk به صورت بازگشتی تمام پوشه‌ها و فایل‌ها را پیدا می‌کند
+            # topdown=True به ما اجازه می‌دهد لیست dirnames را ویرایش کنیم
+            for dirpath, dirnames, filenames in os.walk(ROOT_DIRECTORY, topdown=True):
+                
+                # --- بهینه‌سازی: از ورود به پوشه‌های نادیده گرفته شده جلوگیری می‌کنیم ---
+                # ما لیست dirnames را "درجا" (in-place) ویرایش می‌کنیم
+                # [:]
+                dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRECTORIES]
+
+                for filename in filenames:
+                    # مسیر کامل فایل فعلی
+                    file_path = os.path.join(dirpath, filename)
+                    
+                    # مسیر کامل برای مقایسه
+                    abs_file_path = os.path.abspath(file_path)
+
+                    # --- نادیده گرفتن فایل‌ها ---
+                    # 1. اگر فایل فعلی، خود فایل خروجی است، از آن بگذر
+                    if abs_file_path == abs_output_path:
+                        continue
+                        
+                    # 2. اگر پسوند فایل در لیست نادیده گرفته شده‌ها بود، از آن بگذر
+                    file_ext = os.path.splitext(filename)[1].lower()
+                    if file_ext in IGNORED_EXTENSIONS:
+                        continue
+
+                    # --- نوشتن در فایل خروجی ---
+                    try:
+                        # مسیر نسبی فایل (برای نمایش در خروجی)
+                        relative_path = os.path.relpath(file_path, ROOT_DIRECTORY)
+                        # اطمینان از اینکه از اسلش / استفاده می‌شود (برای سازگاری)
+                        relative_path = relative_path.replace(os.path.sep, '/')
+
+                        # 1. نوشتن مسیر فایل طبق فرمت درخواستی شما
+                        outfile.write(f"{relative_path}\n\n")
+
+                        # 2. خواندن محتوای فایل
+                        with open(file_path, 'r', encoding='utf-8') as infile:
+                            content = infile.read()
+                        
+                        # 3. نوشتن محتوای فایل
+                        outfile.write(content)
+                        
+                        # 4. اضافه کردن دو خط جدید برای جدا کردن از فایل بعدی
+                        outfile.write("\n\n")
+
+                    except UnicodeDecodeError:
+                        # این اتفاق زمانی می‌افتد که فایل متنی نیست (مثلاً باینری است)
+                        outfile.write(f"[Error: Cannot read binary file or file with unsupported encoding]\n\n")
+                    except Exception as e:
+                        outfile.write(f"[Error reading file {file_path}: {e}]\n\n")
+
+    except IOError as e:
+        print(f"Error opening or writing to output file {OUTPUT_FILE}: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    
+    print(f"Done! All content written to {OUTPUT_FILE}")
+
+# اجرای تابع اصلی
+if __name__ == "__main__":
+    get_all_files_content()
+
+ICPBackend.txt
+
+
+
+index.php
+
+<?php
+session_start();
+// اگر کاربر لاگین نکرده، به صفحه ورود برود
+if (!isset($_SESSION['user_id'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$user_role = $_SESSION['role'] ?? 'viewer';
+
+// داده‌های سشن را به جاوااسکریپت تزریق می‌کنیم
+$user_data_json = json_encode([
+    'id' => $_SESSION['user_id'],
+    'username' => $_SESSION['username'],
+    'displayName' => $_SESSION['displayName'],
+    'role' => $user_role,
+    'departmentId' => $_SESSION['departmentId'],
+    'permissions' => $_SESSION['permissions']
+]);
+?>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>داشبورد تقویم</title>
+  <link rel="stylesheet" href="style.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body class="display-page">
+
+<script>
+  const CURRENT_USER = <?php echo $user_data_json; ?>;
+</script>
+
+<div id="loader-overlay" class="hidden"> <div class="spinner"></div>
+</div>
+
+<div class="page-container">
+  <header class="main-header">
+    <div class="header-controls left-controls">
+      <div id="color-legend-container">
+        <button id="color-legend-btn">راهنمای رنگ</button>
+        <div id="color-legend-popup"></div>
+      </div>
+      <?php if ($user_role === 'evaluator' || $user_role === 'manager'): ?>
+        <button id="view-toggle-btn" class="small-btn secondary-btn">نمای لیستی</button>
+      <?php endif; ?>
+    </div>
+    
+    <div class="week-navigator">
+        <button id="next-week-btn" class="week-nav-btn" title="هفته بعد">›</button>
+        <h1 id="calendar-title"></h1>
+        <button id="prev-week-btn" class="week-nav-btn" title="هفته قبل">‹</button>
+    </div>
+
+    <div class="header-controls right-controls">
+        <span>کاربر: <?php echo htmlspecialchars($_SESSION['displayName']); ?></span>
+        <a href="logout.php" class="logout-btn">خروج</a>
+    </div>
+  </header>
+  
+  <div id="calendar-grid-container"></div>
+  <div id="calendar-list-container" style="display: none;"></div>
+</div>
+
+<div class="fab-container">
+    <div class="fab-menu" id="fab-menu">
+        </div>
+    <button class="fab fab-main" id="fab-main-btn" title="منوی اصلی">
+        <span>+</span>
+    </button>
+</div>
+
+
+<div id="event-modal" class="modal-overlay">
+  <div class="modal-content">
+    <h3 id="event-modal-title">ثبت رویداد جدید</h3>
+    <form id="event-form">
+      <input type="hidden" id="eventId">
+      <div class="form-group">
+        <label for="eventTitle">عنوان</label>
+        <input type="text" id="eventTitle" required>
+      </div>
+      <div class="form-group">
+        <label for="eventBy">مجری</label>
+        <input type="text" id="eventBy">
+      </div>
+      <div class="form-group">
+        <label for="eventFor">مخاطب</label>
+        <input type="text" id="eventFor">
+      </div>
+
+      <div class="form-group" id="event-goal-group">
+        <label for="eventGoal">هدف</label>
+        <textarea id="eventGoal" rows="3"></textarea>
+      </div>
+
+      <div id="event-colors-manager" style="display: none;">
+        <div class="form-group color-picker">
+          <label>رنگ پس‌زمینه</label>
+          <input type="color" id="eventBgColor" value="#5c6bc0">
+        </div>
+        <div class="form-group color-picker">
+            <label>رنگ متن</label>
+            <input type="color" id="eventTextColor" value="#ffffff">
+        </div>
+      </div>
+
+      <div class="form-group" style="display:flex; align-items:center;">
+        <input type="checkbox" id="isAllDay" style="width:auto; margin-left: 10px;">
+        <label for="isAllDay" style="margin:0;">رویداد تمام-روز</label>
+      </div>
+      
+      <div id="time-inputs" class="time-inputs-container multi-day">
+        <div class="form-group">
+          <label for="startDay">از روز:</label>
+          <select id="startDay">
+            <option value="0">شنبه</option><option value="1">یکشنبه</option><option value="2">دوشنبه</option>
+            <option value="3">سه‌شنبه</option><option value="4">چهارشنبه</option><option value="5">پنجشنبه</option><option value="6">جمعه</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>ساعت شروع:</label>
+          <input type="text" id="startTime" class="time-input" value="09:00" readonly>
+        </div>
+        <div class="form-group">
+          <label for="endDay">تا روز:</label>
+          <select id="endDay">
+            <option value="0">شنبه</option><option value="1">یکشنبه</option><option value="2">دوشنبه</option>
+            <option value="3">سه‌شنبه</option><option value="4">چهارشنبه</option><option value="5">پنجشنبه</option><option value="6">جمعه</option>
+          </select>
+        </div>
+         <div class="form-group">
+          <label>ساعت پایان:</label>
+          <input type="text" id="endTime" class="time-input" value="10:00" readonly>
+        </div>
+      </div>
+      
+      <div class="modal-actions" id="event-modal-actions">
+        <div id="approval-actions" style="display: none;">
+            <button type="button" id="approve-event-btn" class="secondary-btn">تایید رویداد</button>
+            <button type="button" id="reject-event-btn" class="danger-btn">رد رویداد</button>
+        </div>
+        <div>
+            <button type="button" id="delete-event-btn" class="danger-btn" style="display: none;">حذف</button>
+            <button type="submit" id="save-event-btn">ذخیره</button>
+            <button type="button" id="cancel-event-btn" class="secondary-btn">انصراف</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="settings-modal" class="modal-overlay">
+  <div class="modal-content">
+    <h3>تنظیمات اصلی تقویم</h3>
+    <div class="form-group">
+      <label for="mainHeader">عنوان اصلی تقویم</label>
+      <input type="text" id="mainHeader">
+    </div>
+    <div class="form-group">
+      <label for="weekSelector">انتخاب هفته جاری (برای بارگذاری اولیه)</label>
+      <select id="weekSelector"></select>
+    </div>
+    <div class="modal-actions">
+      <button id="save-settings-btn">ذخیره تنظیمات</button>
+      <button id="cancel-settings-btn" class="secondary-btn">انصراف</button>
+    </div>
+  </div>
+</div>
+
+<div id="time-picker-overlay" class="time-picker-overlay"> ... </div>
+<div id="depts-modal" class="modal-overlay"> ... </div>
+<div id="users-modal" class="modal-overlay"> ... </div>
+<div id="issue-modal" class="modal-overlay"> ... </div>
+<div id="view-issues-modal" class="modal-overlay"> ... </div>
+
+
+<script src="app.js"></script>
+</body>
+</html>
+
+login.php
+
+<?php
+session_start();
+// اگر کاربر از قبل لاگین بود، به داشبورد برود
+if (isset($_SESSION['user_id'])) {
+    header('Location: index.php');
+    exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $username = $_POST['username'];
+    $password = $_POST['password'];
+
+    $users = json_decode(file_get_contents('./data/users.json'), true);
+    
+    $found_user = null;
+    foreach ($users as $user) {
+        if ($user['username'] === $username) {
+            $found_user = $user;
+            break;
+        }
+    }
+
+    if ($found_user && password_verify($password, $found_user['password_hash'])) {
+        // احراز هویت موفق
+        $_SESSION['user_id'] = $found_user['id'];
+        $_SESSION['username'] = $found_user['username'];
+        $_SESSION['displayName'] = $found_user['displayName']; // <-- فیلد جدید اضافه شد
+        $_SESSION['role'] = $found_user['role'];
+        $_SESSION['departmentId'] = $found_user['departmentId'];
+        $_SESSION['permissions'] = $found_user['permissions'];
+        
+        header('Location: index.php');
+        exit;
+    } else {
+        // احراز هویت ناموفق
+        $error = 'نام کاربری یا رمز عبور اشتباه است.';
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>ورود به سیستم تقویم</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body class="login-page">
+    <div class="login-container">
+        <h1>ورود به تقویم</h1>
+        <p>برای ورود از اطلاعات زیر استفاده کنید:
+            <br><b>مدیر:</b> admin / password123
+            <br><b>کاربر:</b> proposer / password123
+        </p>
+        <?php if ($error): ?>
+            <div class="login-error"><?php echo $error; ?></div>
+        <?php endif; ?>
+        <form method="POST" action="login.php">
+            <div class="form-group">
+                <label for="username">نام کاربری:</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">رمز عبور:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit">ورود</button>
+        </form>
+    </div>
+</body>
+</html>
+
+logout.php
+
+<?php
+session_start();
+session_unset();
+session_destroy();
+header('Location: login.php');
+exit;
+?>
+
+style.css
+
+/* ==========================================================================
+   1. Global Styles & Variables
+   ========================================================================== */
+:root {
+  --color-primary: #2c3e50;
+  --color-secondary: #198754; 
+  --color-danger: #e53935;
+  --color-warning: #ffb300; 
+  --color-border: #dce0e6; 
+  --color-border-soft: #eaedf0;
+  --color-text: #2c3e50; 
+  --color-text-muted: #7f8c8d; 
+  --color-surface: #ffffff; 
+  --color-background: #f7f8fc;
+  --font-family-base: 'Pinar Regular', sans-serif;
+  --font-family-bold: 'Pinar Bold', sans-serif; 
+  --border-radius: 10px;
+  --shadow-soft: 0 4px 12px rgba(0,0,0,0.08);
+}
+body, input, select, button, textarea, html {
+  margin: 0; padding: 0; font-family: var(--font-family-base);
+  background: var(--color-background); color: var(--color-text);
+  -webkit-print-color-adjust: exact !important; color-adjust: exact !important;
+}
+hr { border: none; border-top: 1px solid var(--color-border-soft); margin: 2.5rem 0; }
+button { cursor: pointer; }
+textarea { font-family: var(--font-family-base); width: 100%; padding: 0.8rem 1rem; box-sizing: border-box; border: 1px solid var(--color-border); border-radius: var(--border-radius); }
+
+/* ==========================================================================
+   2. Login Page Styles
+   ========================================================================== */
+body.login-page {
+  display: flex; align-items: center; justify-content: center;
+  height: 100vh; background: var(--color-primary);
+}
+.login-container {
+  width: 100%; max-width: 400px; padding: 2.5rem;
+  background: var(--color-surface); border-radius: var(--border-radius);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+}
+.login-container h1 { text-align: center; margin-top: 0; color: var(--color-primary); }
+.login-container p { font-size: 0.9rem; background: #f1f1f1; padding: 1rem; border-radius: 8px; line-height: 1.6; }
+.login-error { background: #ffebee; color: var(--color-danger); padding: 1rem; border-radius: 8px; text-align: center; margin-bottom: 1rem; }
+.login-container form button {
+  width: 100%; padding: 0.9rem; font-size: 1.1rem; font-family: var(--font-family-bold); color: white;
+  background: var(--color-secondary); border: none; border-radius: var(--border-radius);
+  margin-top: 1rem; transition: background 0.2s;
+}
+.login-container form button:hover { background: #146c43; }
+
+/* ==========================================================================
+   3. Form, Input, Button Styles (Global)
+   ========================================================================== */
+.form-group { margin-bottom: 1.2rem; }
+.form-group label { display: block; margin-bottom: 0.6rem; font-weight: bold; }
+.form-group input[type="text"],
+.form-group input[type="password"],
+.form-group input[type="color"],
+.form-group select {
+  width: 100%; padding: 0.8rem 1rem; box-sizing: border-box;
+  border: 1px solid var(--color-border); border-radius: var(--border-radius);
+  transition: all 0.2s ease-in-out; background-color: #fdfdfd;
+}
+.form-group input[type="text"]:focus, 
+.form-group input[type="password"]:focus, 
+.form-group select:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(44, 62, 80, 0.15); outline: none;
+}
+.time-inputs-container { display: flex; flex-wrap: wrap; gap: 1rem; }
+/* (جدید) حالت چند روزه برای فرم */
+.time-inputs-container.multi-day .form-group { flex: 1 1 200px; }
+.time-input { text-align: center; font-family: var(--font-family-bold); font-size: 1.2rem; cursor: pointer; }
+button, .button, a.button {
+  flex: 1; padding: 0.9rem; font-size: 1rem; font-family: var(--font-family-bold); color: white;
+  border: none; border-radius: var(--border-radius); cursor: pointer; text-decoration: none; 
+  text-align: center; transition: all 0.2s ease-in-out;
+  background: var(--color-primary);
+}
+button:hover { opacity: 0.85; }
+.danger-btn { background-color: var(--color-danger); }
+.secondary-btn { background-color: #6c757d; color: white; }
+.small-btn { padding: 0.5rem 0.8rem; font-size: 0.9rem; flex-grow: 0; }
+
+/* ==========================================================================
+   4. Modal (Popup) Styles
+   ========================================================================== */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.6); z-index: 1000;
+  display: none; align-items: center; justify-content: center;
+  backdrop-filter: blur(5px);
+}
+.modal-content {
+  background: var(--color-surface); padding: 2rem; border-radius: var(--border-radius);
+  width: 90%; max-width: 600px; display: flex; flex-direction: column;
+  max-height: 90vh; overflow-y: auto;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+}
+.modal-content h3 { margin-top: 0; border-bottom: 2px solid var(--color-border); padding-bottom: 1rem; }
+.modal-actions {
+  display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1.5rem;
+  border-top: 1px solid var(--color-border-soft); padding-top: 1.5rem;
+  justify-content: space-between;
+}
+.modal-actions > div { display: flex; gap: 1rem; }
+
+/* ==========================================================================
+   5. (جدید) Radial FAB Menu
+   ========================================================================== */
+.fab-container {
+  position: fixed;
+  bottom: 2rem;
+  left: 2rem;
+  z-index: 900;
+}
+.fab-main {
+  width: 60px; height: 60px; border-radius: 50%;
+  background: var(--color-primary); color: white; font-size: 2.5rem;
+  border: none; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  padding: 0; display: flex; align-items: center; justify-content: center;
+  position: relative; z-index: 902;
+}
+.fab-main span { transition: transform 0.3s; }
+.fab-main.active span { transform: rotate(45deg); }
+
+.fab-menu {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 60px;
+  height: 60px;
+  z-index: 901;
+}
+.fab-action {
+  position: absolute;
+  bottom: 5px; /* (60 - 50) / 2 */
+  left: 5px;   /* (60 - 50) / 2 */
+  width: 50px; height: 50px; border-radius: 50%;
+  color: white; font-size: 1.5rem;
+  display: flex; align-items: center; justify-content: center;
+  border: none; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  opacity: 0;
+  transform: scale(0.5);
+}
+/* رنگ‌بندی دکمه‌های اکشن */
+.fab-action.action-add { background: var(--color-secondary); }
+.fab-action.action-admin { background: var(--color-primary); }
+.fab-action.action-issue { background: var(--color-warning); color: #333; }
+.fab-action.action-view-issue { background: #6f42c1; }
+
+/* انیمیشن باز شدن منو */
+.fab-menu.active .fab-action {
+  opacity: 1;
+  transform: scale(1);
+}
+/* موقعیت‌دهی دایره‌ای (برای 5 دکمه) */
+.fab-menu.active .fab-action:nth-child(1) { transform: translate(0, -70px); transition-delay: 0.0s; }
+.fab-menu.active .fab-action:nth-child(2) { transform: translate(45px, -55px); transition-delay: 0.05s; }
+.fab-menu.active .fab-action:nth-child(3) { transform: translate(65px, -15px); transition-delay: 0.1s; }
+.fab-menu.active .fab-action:nth-child(4) { transform: translate(45px, 25px); transition-delay: 0.15s; }
+.fab-menu.active .fab-action:nth-child(5) { transform: translate(0, 40px); transition-delay: 0.2s; }
+/* ... (در صورت نیاز به دکمه‌های بیشتر، این الگو ادامه می‌یابد) ... */
+
+
+/* ==========================================================================
+   6. Loader Overlay
+   ========================================================================== */
+#loader-overlay {
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(255, 255, 255, 0.7); z-index: 9999;
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.3s;
+}
+#loader-overlay.hidden { opacity: 0; pointer-events: none; }
+.spinner {
+  width: 50px; height: 50px; border: 5px solid var(--color-border);
+  border-top-color: var(--color-primary); border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ==========================================================================
+   7. Display Page - Header (جدید)
+   ========================================================================== */
+body.display-page { overflow: hidden; height: 100vh; width: 100vw; }
+.page-container { display: flex; flex-direction: column; width: 100%; height: 100%; }
+.main-header {
+  padding: 0.5rem 1.5rem;
+  background-color: var(--color-surface);
+  border-bottom: 2px solid var(--color-border);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.header-controls {
+  display: flex; align-items: center; gap: 1rem;
+  flex-basis: 300px;
+}
+.header-controls.left-controls { justify-content: flex-start; }
+.header-controls.right-controls { justify-content: flex-end; }
+.logout-btn {
+  font-size: 0.9rem; padding: 0.4rem 0.8rem;
+  background: var(--color-danger); color: white;
+  border-radius: 6px; text-decoration: none;
+}
+#view-toggle-btn { padding: 0.4rem 0.8rem; font-size: 0.9rem; }
+
+/* (جدید) Week Navigator */
+.week-navigator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-grow: 1;
+}
+.week-navigator h1 {
+  margin: 0; font-family: 'Pinar Black', sans-serif;
+  font-size: 1.2rem; color: var(--color-primary);
+  text-align: center;
+}
+.week-nav-btn {
+  background: none; border: 1px solid var(--color-border);
+  font-size: 1.5rem; line-height: 1;
+  width: 36px; height: 36px; border-radius: 50%;
+  color: var(--color-text-muted);
+  transition: all 0.2s;
+}
+.week-nav-btn:hover {
+  background: var(--color-background);
+  color: var(--color-primary);
+}
+
+
+/* ==========================================================================
+   8. Display Page - Grid (اصلاح‌شده برای 24 ساعت)
+   ========================================================================== */
+#calendar-grid-container { flex-grow: 1; overflow: hidden; }
+#calendar-list-container { flex-grow: 1; overflow-y: auto; padding: 1rem; }
+.calendar-grid { display: flex; flex-direction: column; height: 100%; }
+.grid-header { display: grid; grid-template-columns: 4rem 6rem 1fr; flex-shrink: 0; background-color: var(--color-surface); }
+.header-corner, .header-allday, .header-timeline { display: flex; align-items: center; justify-content: center; border-bottom: 2px solid var(--color-border); border-left: 2px solid var(--color-border); }
+.header-timeline { border-left: none; }
+.header-allday { font-family: var(--font-family-bold); }
+/* (اصلاح‌شده) 48 ستون برای 24 ساعت */
+.header-timeline { display: grid; grid-template-columns: repeat(48, 1fr); height: 3rem; }
+.time-label { text-align: center; font-size: 0.9rem; color: var(--color-text-muted); border-right: 1px solid var(--color-border-soft); padding-top: 1rem;writing-mode: vertical-rl;transform: rotate(180deg);display: flex;align-items:end;}
+.time-label:nth-child(2n) { border-right: 1px solid var(--color-border); font-weight: bold; color: var(--color-text); }
+.grid-body { flex-grow: 1; overflow-y: auto; }
+.day-row { display: grid; grid-template-columns: 4rem 6rem 1fr; min-height: 5rem; }
+.day-label, .all-day-cell, .timeline-cell { border-bottom: 1px solid var(--color-border); }
+.day-label { display: flex; flex-direction: column; align-items: center; justify-content: center; border-left: 2px solid var(--color-border); background-color: #fbfcfe; font-family: var(--font-family-bold); font-size: 1.1rem; text-align: center; }
+.day-label .date { font-family: 'Pinar Light'; font-size: 0.8rem; color: var(--color-text-muted); }
+.all-day-cell { border-left: 2px solid var(--color-border); padding: 2px; display: grid; grid-template-rows: repeat(var(--event-count, 1), 1fr); gap: 2px; overflow: hidden; }
+/* (اصلاح‌شده) 48 ستون برای 24 ساعت */
+.timeline-cell {
+  position: relative;
+  background-image: repeating-linear-gradient(to left, var(--color-border-soft) 0 1px, transparent 1px 100%), repeating-linear-gradient(to left, var(--color-border) 0 1px, transparent 1px 100%);
+  background-size: calc(100% / 48) 100%, calc(100% / 24) 100%;
+}
+.is-holiday .day-label, .is-holiday .all-day-cell, .is-holiday .timeline-cell { background-color: #ffebee; }
+
+/* ==========================================================================
+   9. Event Styles (اصلاح‌شده برای چند روزه)
+   ========================================================================== */
+.event, .event-allday {
+  border-radius: 4px; padding: 2px 4px; font-size: 0.7rem; overflow: hidden;
+  text-align: center; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  cursor: pointer; transition: all 0.2s;
+}
+.event-wrapper { position: absolute; box-sizing: border-box; padding: 2px 3px 8px 12px; }
+.event { width: 100%; height: 100%; border: 1px solid rgba(0,0,0,0.2); }
+.event-wrapper:hover .event { z-index: 10; box-shadow: var(--shadow-soft); transform: scale(1.02); }
+
+/* (جدید) استایل‌های بصری رویداد چند روزه */
+.event[data-ismultiday="true"]:not([data-isstart="true"]) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right-width: 0;
+  padding-right: 0;
+}
+.event[data-ismultiday="true"]:not([data-isend="true"]) {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid rgba(255,255,255,0.3); /* خط جداکننده داخلی */
+}
+
+.event-title { font-family: var(--font-family-bold); font-size: 0.7rem; }
+.event-meta { opacity: 0.9; font-size: 0.6rem; white-space: nowrap; }
+.event-dept {
+  font-size: 0.6rem; font-family: var(--font-family-bold);
+  background: rgba(0,0,0,0.2); padding: 1px 4px;
+  border-radius: 3px; margin-top: 2px;
+}
+.event.event-ultra-condensed .event-title, .event-allday.event-ultra-condensed .event-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* -- Event Statuses -- */
+.event.status-approved, .event-allday.status-approved { color: white; }
+.event.status-pending, .event-allday.status-pending {
+  background-color: #fff9c4; color: #333;
+  border-color: #fbc02d;
+  background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.05) 0, rgba(0,0,0,0.05) 5px, transparent 5px, transparent 10px);
+}
+.event.status-rejected, .event-allday.status-rejected {
+  background-color: #eeeeee; color: #757575;
+  border-color: #9e9e9e; opacity: 0.8;
+  background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.1) 0, rgba(0,0,0,0.1) 5px, transparent 5px, transparent 10px);
+}
+.event.status-rejected .event-title::after, 
+.event-allday.status-rejected .event-title::after {
+  content: "(رد شده)";
+  color: var(--color-danger);
+  font-size: 0.9em;
+  margin-right: 4px;
+}
+.event-locked { cursor: not-allowed !important; }
+
+/* ==========================================================================
+   10. Color Legend
+   ========================================================================== */
+#color-legend-container { position: relative; }
+#color-legend-btn {
+  background: none; border: 1px solid var(--color-border);
+  padding: 0.4rem 0.8rem; font-size: 0.9rem;
+  border-radius: 6px; color: var(--color-text);
+}
+#color-legend-popup {
+  display: none; position: absolute;
+  top: 100%; right: 0; background: var(--color-surface);
+  border: 1px solid var(--color-border); border-radius: var(--border-radius);
+  box-shadow: var(--shadow-soft); padding: 1rem;
+  width: 250px; z-index: 100; margin-top: 5px;
+}
+#color-legend-popup h4 { margin: 0 0 1rem 0; padding-bottom: 0.5rem; border-bottom: 1px solid var(--color-border-soft); }
+#color-legend-popup ul { list-style: none; padding: 0; margin: 0; }
+#color-legend-popup li { display: flex; align-items: center; margin-bottom: 0.5rem; }
+#color-legend-popup .legend-swatch {
+  width: 20px; height: 20px; border-radius: 4px;
+  margin-left: 0.75rem; border: 1px solid rgba(0,0,0,0.1);
+}
+
+/* ==========================================================================
+   11. Manager Settings Modals Styles
+   ========================================================================== */
+#depts-list-editor .dept-item {
+  display: grid; grid-template-columns: 1fr 1fr auto auto;
+  gap: 1rem; align-items: center; background: #f9f9f9;
+  padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem;
+}
+#users-list-editor .user-item {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  gap: 1rem; align-items: center; background: #f9f9f9;
+  padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem;
+  font-size: 0.9rem;
+}
+#users-list-editor .user-item-permissions {
+    grid-column: 1 / -1; font-size: 0.9rem;
+    padding-top: 1rem; margin-top: 1rem;
+    border-top: 1px solid var(--color-border-soft);
+}
+.permission-group { margin-bottom: 1rem; }
+.permission-group h5 { margin: 0 0 0.5rem 0; font-family: var(--font-family-bold); }
+.permission-group-items {
+    display: flex; flex-wrap: wrap; gap: 0.5rem 1rem;
+    max-height: 100px; overflow-y: auto; background: white;
+    padding: 0.5rem; border-radius: 6px; border: 1px solid var(--color-border);
+}
+.permission-group-items label { font-weight: normal; font-size: 0.9rem; }
+.permission-group-items input { width: auto; margin-left: 0.5rem; }
+#users-list-editor .user-item-actions {
+    grid-column: 1 / -1; display: flex;
+    justify-content: flex-end; gap: 0.5rem;
+    padding-top: 1rem; margin-top: 1rem;
+    border-top: 1px solid var(--color-border);
+}
+#users-list-editor .user-item-actions button {
+    padding: 0.5rem; font-size: 0.8rem;
+    flex: 0 1 auto; width: 100px;
+}
+#issues-list-container .issue-item {
+  background: #f9f9f9; border-radius: 8px;
+  padding: 1rem; margin-bottom: 1rem;
+  border-right: 5px solid var(--color-warning);
+}
+#issues-list-container .issue-item p { margin: 0.5rem 0; font-size: 1rem; }
+#issues-list-container .issue-meta { font-size: 0.8rem; color: var(--color-text-muted); }
+
+/* ==========================================================================
+   12. Evaluator List View
+   ========================================================================== */
+#calendar-list-container h2 {
+    font-family: 'Pinar Black', sans-serif;
+    color: var(--color-primary);
+    border-bottom: 2px solid var(--color-border);
+    padding-bottom: 0.5rem; margin-top: 0;
+}
+.list-view-item {
+    background: var(--color-surface); border-radius: var(--border-radius);
+    margin-bottom: 1rem; box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    border: 1px solid var(--color-border-soft);
+    display: grid; grid-template-columns: 120px 1fr 2fr;
+    align-items: center;
+}
+.list-view-time {
+    padding: 1.5rem; font-family: var(--font-family-bold);
+    font-size: 1.1rem; text-align: center;
+    border-left: 1px solid var(--color-border-soft);
+}
+.list-view-time .list-day { font-size: 0.9rem; font-family: var(--font-family-base); color: var(--color-text-muted); }
+.list-view-details { padding: 1.5rem; border-left: 1px solid var(--color-border-soft); }
+.list-view-details h4 { margin: 0 0 0.5rem 0; font-family: var(--font-family-bold); color: var(--color-primary); }
+.list-view-details span { font-size: 0.9rem; color: var(--color-text-muted); display: block; }
+.list-view-goal { padding: 1.5rem; }
+.list-view-goal h5 { margin: 0 0 0.5rem 0; font-size: 0.9rem; color: var(--color-text-muted); }
+.list-view-goal p { margin: 0; font-size: 0.9rem; line-height: 1.6; }
+
+/* ==========================================================================
+   13. Mobile & Print (اصلاح‌شده برای 24 ساعت)
+   ========================================================================== */
+@media (max-width: 768px) {
+  .fab-container { bottom: 1rem; left: 1rem; }
+  .fab-main { width: 50px; height: 50px; font-size: 2rem; }
+  .fab-action { width: 40px; height: 40px; font-size: 1.2rem; }
+  .fab-menu.active .fab-action:nth-child(1) { transform: translate(0, -55px); }
+  .fab-menu.active .fab-action:nth-child(2) { transform: translate(35px, -45px); }
+  .fab-menu.active .fab-action:nth-child(3) { transform: translate(50px, -10px); }
+  /* ... */
+
+  .main-header { padding: 0.5rem; flex-wrap: wrap; justify-content: center; }
+  .week-navigator { order: -1; width: 100%; margin-bottom: 0.5rem; }
+  .week-navigator h1 { font-size: 1.1rem; }
+  .header-controls { flex-basis: auto; }
+  .header-controls.right-controls { flex-grow: 1; justify-content: flex-end; }
+
+  #users-list-editor .user-item { grid-template-columns: 1fr 1fr; }
+  #users-list-editor .user-item-actions { grid-column: 1 / -1; flex-direction: row; }
+  .list-view-item { grid-template-columns: 1fr; }
+  .list-view-time, .list-view-details { border-left: none; border-bottom: 1px solid var(--color-border-soft); }
+
+  .mobile-grid { display: flex; flex-direction: row; height: 100%; }
+  .mobile-time-axis { display: flex; flex-direction: column; flex-shrink: 0; width: 4rem; background-color: var(--color-surface); border-left: 1px solid var(--color-border); }
+  .time-label-mobile {
+      flex-grow: 1; display: flex; align-items: center; justify-content: center;
+      font-size: 0.8rem; color: var(--color-text-muted);
+      border-bottom: 1px solid var(--color-border);
+      height: 2.5rem; /* فشرده‌تر شدن برای 24 ساعت */
+  }
+  .time-label-mobile.all-day-header { height: 4rem; font-family: var(--font-family-bold); color: var(--color-text); border-bottom: 2px solid var(--color-border); }
+  .mobile-days-container { display: flex; flex-direction: row; flex-grow: 1; overflow-x: auto; scroll-snap-type: x mandatory; }
+  .day-column { display: flex; flex-direction: column; width: 80vw; min-width: 280px; flex-shrink: 0; scroll-snap-align: start; border-right: 2px solid var(--color-border); }
+  .day-column:first-child { border-right: 2px solid var(--color-border); }
+  .day-column .day-label { border-left: none; border-bottom: 2px solid var(--color-border); padding: 0.5rem; }
+  .day-column .all-day-cell { min-height: 4rem; border-left: none; border-bottom: 2px solid var(--color-border); }
+  /* (اصلاح‌شده) 48 ردیف برای 24 ساعت */
+  .day-column .timeline-cell {
+      border-left: none; flex-grow: 1;
+      background-image: repeating-linear-gradient(to bottom, var(--color-border-soft) 0 1px, transparent 1px 100%), repeating-linear-gradient(to bottom, var(--color-border) 0 1px, transparent 1px 100%);
+      background-size: 100% calc(100% / 48), 100% calc(100% / 24);
+  }
+  .day-column .event-wrapper { padding: 2px; }
+  .day-column .event, .day-column .event-allday { justify-content: flex-start; padding-top: 5px; align-items: center; }
+}
+
+@media print {
+  body { overflow: visible; font-size: 8pt; background: #fff; }
+  @page { size: A4 landscape; margin: 0.7cm; }
+  .page-container { height: auto; border: 3px double #333; padding: 0.5cm; box-sizing: border-box; }
+  .main-header { padding: 0 0 0.5cm 0; text-align: center; box-shadow: none; border-bottom: 2px solid #333; margin-bottom: 0.5cm; }
+  .main-header h1 { font-size: 1.5rem; }
+  .calendar-grid, .mobile-grid { border: 1px solid #666; }
+  .grid-body, .mobile-days-container { overflow: hidden; height: 16cm; }
+  .event, .event-allday { box-shadow: none; border: 1px solid #777; }
+  .fab-container, .modal-overlay, #loader-overlay, .header-controls, .week-nav-btn { display: none; }
+  #calendar-list-container { display: none; }
+}
+
+data/.htaccess
+
+Deny from all
+
+data/data.json
+
+{
+    "settings": {
+        "headerText": "برنامه هفتگی جامع دپارتمان‌ها",
+        "weekStartDate": "2025-10-16"
+    },
+    "holidays": [
+        {
+            "day": 6,
+            "occasion": "جمعه"
+        }
+    ],
+    "departments": [
+        {
+            "id": "d1",
+            "name": "دپارتمان تولید",
+            "color": "#fd7e14"
+        },
+        {
+            "id": "d2",
+            "name": "دپارتمان فنی",
+            "color": "#0d6efd"
+        },
+        {
+            "id": "d3",
+            "name": "دپارتمان بازرگانی",
+            "color": "#198754"
+        }
+    ],
+    "events": [
+        {
+            "id": 1729328400000,
+            "title": "جلسه بازبینی تولید",
+            "by": "تیم تولید",
+            "for": "همه",
+            "color": "#fd7e14",
+            "textColor": "#ffffff",
+            "isAllDay": false,
+            "startDay": 0,
+            "startTime": "10:00",
+            "endDay": 0,
+            "endTime": "11:00",
+            "proposerId": "u_proposer_1",
+            "departmentId": "d1",
+            "status": "pending",
+            "goal": "بررسی پیشرفت پروژه X و مشکلات خط تولید."
+        },
+        {
+            "id": 1729328400001,
+            "title": "رویداد چند روزه فنی",
+            "by": "تیم فنی",
+            "for": "مدیران",
+            "color": "#0d6efd",
+            "textColor": "#ffffff",
+            "isAllDay": false,
+            "startDay": 1,
+            "startTime": "14:00",
+            "endDay": 3,
+            "endTime": "11:00",
+            "proposerId": "u_evaluator_1",
+            "departmentId": "d2",
+            "status": "approved",
+            "goal": "اعمال پچ‌های امنیتی و مانیتورینگ سرورها طی ۳ روز."
+        },
+        {
+            "id": 1729328400002,
+            "title": "رویداد تمام روز (تعطیلات)",
+            "by": "منابع انسانی",
+            "for": "همه",
+            "color": "#198754",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "startDay": 4,
+            "startTime": "00:00",
+            "endDay": 4,
+            "endTime": "24:00",
+            "proposerId": "u_manager_1",
+            "departmentId": "d3",
+            "status": "approved",
+            "goal": "رویداد داخلی شرکت."
+        }
+    ]
+}
+
+data/issues.json
+
+[
+    {
+        "id": 1761224509,
+        "userId": "u_manager_1",
+        "userName": "مدیر سیستم",
+        "text": "پیام ۱\nمشکل سیستم چیه؟",
+        "timestamp": "2025-10-23T15:01:49+02:00",
+        "status": "new"
+    }
+]
+
+data/users.json
+
+[
+    {
+        "id": "u_manager_1",
+        "username": "admin",
+        "displayName": "مدیر سیستم",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "manager",
+        "departmentId": null,
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": true,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_proposer_1",
+        "username": "proposer",
+        "displayName": "کاربر تولید",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "proposer",
+        "departmentId": "d1",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d1"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_evaluator_1",
+        "username": "evaluator",
+        "displayName": "ارزیاب فنی",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "evaluator",
+        "departmentId": "d2",
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_viewer_1",
+        "username": "viewer",
+        "displayName": "بیننده (بازرگانی)",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "viewer",
+        "departmentId": "d3",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d3"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    }
+]
+

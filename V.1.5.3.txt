@@ -1,0 +1,3481 @@
+api.php
+
+<?php
+session_start();
+header('Content-Type: application/json; charset=utf-8');
+// Error reporting (disable in production)
+// ini_set('display_errors', 1);
+// error_reporting(E_ALL);
+
+date_default_timezone_set('Asia/Tehran'); // Set server timezone
+
+// --- Constants ---
+define('DATA_FILE', './data/data.json');
+define('USERS_FILE', './data/users.json');
+define('ISSUES_FILE', './data/issues.json');
+
+// Define Roles and Statuses as constants
+define('ROLE_MANAGER', 'manager');
+define('ROLE_EVALUATOR', 'evaluator');
+define('ROLE_PROPOSER', 'proposer');
+define('ROLE_VIEWER', 'viewer');
+
+define('STATUS_APPROVED', 'approved');
+define('STATUS_PENDING', 'pending');
+define('STATUS_REJECTED', 'rejected');
+
+// --- Authentication Check ---
+if (!isset($_SESSION['user_id'])) {
+    http_response_code(401); // Unauthorized
+    echo json_encode(['success' => false, 'message' => 'Unauthorized']);
+    exit;
+}
+
+// --- Current User Info ---
+$CURRENT_USER_ID = $_SESSION['user_id'];
+$CURRENT_USER_ROLE = $_SESSION['role'];
+$CURRENT_USER_DEPT_ID = $_SESSION['departmentId'];
+$CURRENT_USER_PERMS = $_SESSION['permissions'];
+
+// --- Helper Functions for File Operations with Locking ---
+
+/**
+ * Reads data from a JSON file with shared locking.
+ * @param string $file The path to the JSON file.
+ * @return array|null The decoded data or null on failure.
+ */
+function readData($file) {
+    $handle = fopen($file, 'r');
+    if (!$handle) return null;
+
+    // Acquire shared lock (LOCK_SH) - allows multiple readers
+    if (!flock($handle, LOCK_SH)) {
+        fclose($handle);
+        error_log("Could not acquire shared lock for reading: $file");
+        return null;
+    }
+
+    $content = stream_get_contents($handle); // Read entire file
+
+    // Release lock
+    flock($handle, LOCK_UN);
+    fclose($handle);
+
+    if ($content === false) return null;
+
+    $data = json_decode($content, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        error_log("JSON Decode Error in $file: " . json_last_error_msg());
+        return null; // Return null if JSON is invalid
+    }
+
+    // Ensure essential arrays exist
+    if (is_array($data)) {
+        $data['events'] = isset($data['events']) && is_array($data['events']) ? $data['events'] : [];
+        $data['departments'] = isset($data['departments']) && is_array($data['departments']) ? $data['departments'] : [];
+        $data['holidays'] = isset($data['holidays']) && is_array($data['holidays']) ? $data['holidays'] : [];
+        if ($file === USERS_FILE && !is_array($data)) return []; // Users file must be an array
+        if ($file === ISSUES_FILE && !is_array($data)) return []; // Issues file must be an array
+    } else {
+        // If the file content wasn't a valid JSON object/array, return default structure
+        if ($file === DATA_FILE) return ['settings' => [], 'events' => [], 'holidays' => [], 'departments' => []];
+        if ($file === USERS_FILE) return [];
+        if ($file === ISSUES_FILE) return [];
+    }
+
+    return $data;
+}
+
+/**
+ * Writes data to a JSON file with exclusive locking.
+ * @param string $file The path to the JSON file.
+ * @param mixed $data The data to encode and write.
+ * @return bool True on success, false on failure.
+ */
+function writeData($file, $data) {
+    // Sort events before writing if applicable
+    if ($file === DATA_FILE && isset($data['events']) && is_array($data['events'])) {
+        usort($data['events'], function($a, $b) {
+            $startA = $a['startDateTime'] ?? '9999-12-31T23:59:59';
+            $startB = $b['startDateTime'] ?? '9999-12-31T23:59:59';
+            // Basic ISO 8601 validation (allows offset)
+            $regex = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2}|Z)?$/';
+            if (!preg_match($regex, $startA)) $startA = '9999-12-31T23:59:59';
+            if (!preg_match($regex, $startB)) $startB = '9999-12-31T23:59:59';
+            return strcmp($startA, $startB);
+        });
+    }
+
+    $jsonData = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    if ($jsonData === false) {
+        error_log("JSON Encode Error writing to $file: " . json_last_error_msg());
+        return false;
+    }
+
+    $handle = fopen($file, 'c'); // Open for writing, create if doesn't exist, place pointer at beginning
+    if (!$handle) return false;
+
+    // Acquire exclusive lock (LOCK_EX) - prevents others from reading/writing
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        error_log("Could not acquire exclusive lock for writing: $file");
+        return false;
+    }
+
+    // Truncate file to zero length before writing
+    if (!ftruncate($handle, 0)) {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        error_log("Could not truncate file: $file");
+        return false;
+    }
+
+    // Write the data
+    $result = fwrite($handle, $jsonData);
+
+    // Release lock
+    flock($handle, LOCK_UN);
+    fclose($handle);
+
+    return $result !== false;
+}
+
+/**
+ * Basic string sanitization (replace deprecated FILTER_SANITIZE_STRING).
+ * Removes tags and optionally encodes special characters.
+ * @param string|null $input The input string.
+ * @param bool $encodeEntities Whether to encode HTML entities.
+ * @return string The sanitized string.
+ */
+function sanitizeString($input, $encodeEntities = false) {
+    $cleaned = strip_tags((string)$input); // Remove HTML/PHP tags
+    if ($encodeEntities) {
+        // Use this if the output is directly embedded in HTML attributes or needs stricter encoding
+        return htmlspecialchars($cleaned, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+    // For general storage where HTML isn't expected, strip_tags is often sufficient.
+    // Ensure database layer handles SQL injection prevention (e.g., prepared statements).
+    return $cleaned;
+}
+
+// --- Action Handling ---
+$action = $_GET['action'] ?? '';
+$input = json_decode(file_get_contents('php://input'), true);
+
+try {
+    // Read initial data (uses locking internally)
+    $appData = readData(DATA_FILE);
+    $usersData = readData(USERS_FILE); // This is expected to be an array of users
+    $issuesData = readData(ISSUES_FILE); // This is expected to be an array of issues
+
+    if ($appData === null || $usersData === null || $issuesData === null) {
+        throw new Exception('Critical Error: One or more data files (data.json, users.json, issues.json) could not be read or locked.');
+    }
+
+    // Create lookup maps for faster access (after reading)
+    $eventMap = array_column($appData['events'] ?? [], null, 'id');
+    $userMap = array_column($usersData ?? [], null, 'id');
+    $departmentMap = array_column($appData['departments'] ?? [], null, 'id');
+
+
+    switch ($action) {
+
+        case 'getData':
+            $data = $appData; // Use the already read data
+
+            $weekStartDateStr = $_GET['weekStartDate'] ?? $data['settings']['weekStartDate'] ?? null;
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $weekStartDateStr)) {
+                $weekStartDateStr = date('Y-m-d'); // Default to today (Tehran time)
+            }
+
+            try {
+                 $weekStartDT = new DateTime($weekStartDateStr, new DateTimeZone('Asia/Tehran'));
+                 $weekStartDT->setTime(0, 0, 0);
+                 $weekEndDT = clone $weekStartDT;
+                 $weekEndDT->modify('+7 days');
+            } catch (Exception $e) {
+                // Fallback if date parsing fails
+                error_log("Failed to parse week start date: " . $weekStartDateStr . " - Error: " . $e->getMessage());
+                $weekStartDT = new DateTime('today', new DateTimeZone('Asia/Tehran'));
+                $weekStartDT->setTime(0,0,0);
+                $weekEndDT = clone $weekStartDT;
+                $weekEndDT->modify('+7 days');
+            }
+
+
+            $dateFilteredEvents = [];
+            foreach ($data['events'] as $event) {
+                // Basic validation for existence and format
+                 $startStr = $event['startDateTime'] ?? null;
+                 $endStr = $event['endDateTime'] ?? null;
+                 // Regex allowing offset or Z
+                 $dateTimeRegex = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)?$/';
+                 $endDateTimeRegex = '/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}(:\d{2})?|24:00(:00)?)?([+-]\d{2}:\d{2}|Z)?$/';
+
+                if (!$startStr || !$endStr || !preg_match($dateTimeRegex, $startStr) || !preg_match($endDateTimeRegex, $endStr)) {
+                     error_log("Skipping event due to invalid/missing date format: ID " . ($event['id'] ?? 'N/A'));
+                    continue;
+                }
+
+                try {
+                    $eventStartDT = new DateTime($startStr);
+
+                    // Handle T24:00:00 specifically for comparison end point
+                    $isEndTime24 = str_contains($endStr, 'T24:00');
+                    if ($isEndTime24) {
+                        $datePart = substr($endStr, 0, 10);
+                        $offsetOrZ = substr($endStr, 19); // Get offset/Z if exists
+                        $eventEndCompareDT = new DateTime($datePart . 'T00:00:00' . $offsetOrZ);
+                        $eventEndCompareDT->modify('+1 day');
+                    } else {
+                        $eventEndCompareDT = new DateTime($endStr);
+                    }
+
+                    // Check for overlap with the requested week
+                    if ($eventStartDT < $weekEndDT && $eventEndCompareDT > $weekStartDT) {
+                        $dateFilteredEvents[] = $event;
+                    }
+                } catch (Exception $e) {
+                    error_log("Error processing event dates for filtering: ID " . ($event['id'] ?? 'N/A') . " - Error: " . $e->getMessage());
+                    continue; // Skip invalid events
+                }
+            }
+
+            // Apply access filters
+             $filteredEvents = [];
+             $canViewAllDepts = $CURRENT_USER_PERMS['view_all_depts'] ?? false;
+             $allowedViewDepts = $CURRENT_USER_PERMS['view_depts'] ?? [];
+             $canViewAllUsers = $CURRENT_USER_PERMS['view_all_users'] ?? false;
+             $allowedViewUsers = $CURRENT_USER_PERMS['view_users'] ?? [];
+
+            if ($CURRENT_USER_ROLE === ROLE_MANAGER || $CURRENT_USER_ROLE === ROLE_EVALUATOR) {
+                // Managers and Evaluators see all pending and approved events within the date range
+                foreach ($dateFilteredEvents as $event) {
+                    $status = $event['status'] ?? '';
+                    if ($status === STATUS_APPROVED || $status === STATUS_PENDING) {
+                        $filteredEvents[] = $event;
+                    }
+                }
+            } else {
+                 // Proposers and Viewers have more complex rules
+                foreach ($dateFilteredEvents as $event) {
+                    $proposerId = $event['proposerId'] ?? null;
+                    $deptId = $event['departmentId'] ?? null;
+                    $status = $event['status'] ?? '';
+
+                    $isOwnEvent = ($proposerId === $CURRENT_USER_ID);
+
+                    // Always show own events regardless of status (unless maybe deleted - though delete removes it)
+                    if ($isOwnEvent) {
+                        $filteredEvents[] = $event;
+                        continue;
+                    }
+
+                    // For others' events, only show if approved
+                    if ($status !== STATUS_APPROVED) {
+                        continue;
+                    }
+
+                    // Check department access
+                    $hasDeptAccess = $canViewAllDepts || ($deptId && in_array($deptId, $allowedViewDepts));
+                    // Check user access
+                    $hasUserAccess = $canViewAllUsers || ($proposerId && in_array($proposerId, $allowedViewUsers));
+
+                    // Show if user has access via department OR specific user permission
+                    if ($hasDeptAccess || $hasUserAccess) {
+                        $filteredEvents[] = $event;
+                    }
+                }
+            }
+
+
+            // Prepare output data
+            $outputData = [
+                'settings' => $data['settings'] ?? [],
+                'events' => $filteredEvents, // Return only the filtered events
+                'holidays' => $data['holidays'] ?? [],
+                'departments' => $data['departments'] ?? [],
+                'users' => array_map(function($user) { // Remove password hashes for client
+                    unset($user['password_hash']);
+                    return $user;
+                }, $usersData ?? []) // Use the user data read initially
+            ];
+
+            echo json_encode(['success' => true, 'data' => $outputData]);
+            break;
+
+        case 'saveSettings':
+            if ($CURRENT_USER_ROLE !== ROLE_MANAGER) throw new Exception('Access Denied');
+            $data = $appData; // Use initial data
+            if (isset($input['headerText'])) {
+                $data['settings']['headerText'] = sanitizeString($input['headerText']);
+            }
+            if (isset($input['weekStartDate']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $input['weekStartDate'])) {
+                $data['settings']['weekStartDate'] = $input['weekStartDate'];
+            }
+            if (writeData(DATA_FILE, $data)) {
+                 echo json_encode(['success' => true, 'message' => 'Settings saved successfully']);
+            } else {
+                throw new Exception('Failed to save settings. Check file permissions or disk space.');
+            }
+            break;
+
+        case 'saveEvent':
+            if ($CURRENT_USER_ROLE === ROLE_VIEWER) throw new Exception('Access Denied');
+
+            $data = $appData; // Use initial data
+            $eventData = $input['event'] ?? [];
+            $isEditing = !empty($eventData['id']);
+            $eventId = $eventData['id'] ?? null;
+
+             // --- Input Validation ---
+             $startStr = $eventData['startDateTime'] ?? null;
+             $endStr = $eventData['endDateTime'] ?? null;
+             $dateTimeRegex = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2}|Z)?$/';
+             $endDateTimeRegex = '/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2}|24:00:00)([+-]\d{2}:\d{2}|Z)?$/';
+
+             if (!$startStr || !$endStr || !preg_match($dateTimeRegex, $startStr) || !preg_match($endDateTimeRegex, $endStr)) {
+                 throw new Exception("Invalid start/end date-time format.");
+             }
+             if (empty($eventData['title'])) {
+                 throw new Exception("Event title cannot be empty.");
+             }
+
+             try {
+                $startDT = new DateTime($startStr);
+                // Handle T24:00:00 specifically for comparison
+                $isEndTime24 = str_contains($endStr, 'T24:00:00');
+                if ($isEndTime24) {
+                    $datePart = substr($endStr, 0, 10);
+                    $offsetOrZ = substr($endStr, 19);
+                    $compareEndDT = new DateTime($datePart . 'T00:00:00' . $offsetOrZ);
+                    $compareEndDT->modify('+1 day');
+                } else {
+                    $compareEndDT = new DateTime($endStr);
+                }
+                if ($compareEndDT <= $startDT) {
+                    throw new Exception("End date/time must be after start date/time.");
+                }
+             } catch (Exception $e) {
+                 throw new Exception("Error processing date/times: " . $e->getMessage());
+             }
+             // --- End Validation ---
+
+             // Sanitize general string inputs
+             $sanitizedEventData = [
+                'title' => sanitizeString($eventData['title']),
+                'by' => sanitizeString($eventData['by'] ?? ''),
+                'for' => sanitizeString($eventData['for'] ?? ''),
+                'goal' => sanitizeString($eventData['goal'] ?? ''), // Keep basic formatting characters if needed
+                'isAllDay' => !empty($eventData['isAllDay']),
+                'startDateTime' => $startStr, // Already validated
+                'endDateTime' => $endStr,     // Already validated
+             ];
+
+             $message = '';
+
+            if ($isEditing) {
+                // Find event using the map
+                if (!isset($eventMap[$eventId])) {
+                    throw new Exception('Event not found for editing.');
+                }
+                $existingEvent = $eventMap[$eventId];
+                $eventIndex = array_search($eventId, array_keys($eventMap)); // Find index for update/splice
+
+                // Permission Check
+                 $canEdit = ($CURRENT_USER_ROLE === ROLE_MANAGER) ||
+                            ($CURRENT_USER_ROLE === ROLE_EVALUATOR) ||
+                            (($existingEvent['proposerId'] ?? null) === $CURRENT_USER_ID &&
+                             in_array($existingEvent['status'] ?? '', [STATUS_PENDING, STATUS_REJECTED]));
+                 if (!$canEdit) {
+                    throw new Exception('You do not have permission to edit this event.');
+                 }
+
+                // Merge sanitized data, respecting permissions
+                 $updatedEvent = $existingEvent;
+                 foreach ($sanitizedEventData as $key => $value) {
+                    $updatedEvent[$key] = $value;
+                 }
+
+                 // Manager-specific updates
+                 if ($CURRENT_USER_ROLE === ROLE_MANAGER) {
+                     if (isset($eventData['color'])) $updatedEvent['color'] = sanitizeString($eventData['color']); // Basic hex/name validation could be added
+                     if (isset($eventData['textColor'])) $updatedEvent['textColor'] = sanitizeString($eventData['textColor']);
+                     if (isset($eventData['departmentId'])) $updatedEvent['departmentId'] = sanitizeString($eventData['departmentId']) ?: null;
+                 }
+                  // Status update permission (Manager or Evaluator)
+                 if (($CURRENT_USER_ROLE === ROLE_MANAGER || $CURRENT_USER_ROLE === ROLE_EVALUATOR) && isset($eventData['status']) && in_array($eventData['status'], [STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED])) {
+                      $updatedEvent['status'] = $eventData['status'];
+                       // Auto-apply department color if approving and no color exists
+                       if ($updatedEvent['status'] === STATUS_APPROVED && !isset($updatedEvent['color'])) {
+                            $deptId = $updatedEvent['departmentId'] ?? $existingEvent['departmentId'] ?? null;
+                            $deptColor = isset($departmentMap[$deptId]) ? $departmentMap[$deptId]['color'] : '#5c6bc0';
+                            $updatedEvent['color'] = $deptColor;
+                            $updatedEvent['textColor'] = '#ffffff'; // Default text color
+                       }
+                 }
+                 // If proposer edits a rejected event, it stays rejected unless Manager/Evaluator changes it.
+                 elseif ($CURRENT_USER_ROLE === ROLE_PROPOSER && $existingEvent['status'] === STATUS_REJECTED) {
+                    $updatedEvent['status'] = STATUS_REJECTED;
+                 }
+
+                 $data['events'][$eventIndex] = $updatedEvent;
+                 $message = 'Event updated successfully';
+
+            } else {
+                 // Creating new event
+                $newEvent = $sanitizedEventData; // Start with sanitized data
+                $newEvent['id'] = time() . '_' . rand(100, 999); // More robust ID
+                $newEvent['proposerId'] = $CURRENT_USER_ID;
+                $newEvent['departmentId'] = $CURRENT_USER_DEPT_ID; // Assign proposer's department
+
+                $deptColor = isset($departmentMap[$CURRENT_USER_DEPT_ID]) ? $departmentMap[$CURRENT_USER_DEPT_ID]['color'] : '#c8c8c8';
+                $defaultTextColor = '#ffffff';
+
+                 if ($CURRENT_USER_ROLE === ROLE_MANAGER || $CURRENT_USER_ROLE === ROLE_EVALUATOR) {
+                     $newEvent['status'] = STATUS_APPROVED;
+                     // Allow manager to override colors on creation
+                     $newEvent['color'] = sanitizeString($eventData['color'] ?? $deptColor);
+                     $newEvent['textColor'] = sanitizeString($eventData['textColor'] ?? $defaultTextColor);
+                     $message = 'Event added successfully';
+                 } else { // Proposer
+                    $newEvent['status'] = STATUS_PENDING;
+                    $newEvent['color'] = $deptColor; // Use department color or default grey
+                    $newEvent['textColor'] = $defaultTextColor;
+                    $message = 'Event proposed successfully. Waiting for approval.';
+                 }
+                 $data['events'][] = $newEvent;
+            }
+
+            // Write updated data back to file
+            if (writeData(DATA_FILE, $data)) {
+                 echo json_encode(['success' => true, 'message' => $message]);
+            } else {
+                throw new Exception('Failed to save event data.');
+            }
+            break;
+
+        case 'updateEventStatus':
+            if ($CURRENT_USER_ROLE !== ROLE_MANAGER && $CURRENT_USER_ROLE !== ROLE_EVALUATOR) throw new Exception('Access Denied');
+
+            $data = $appData;
+            $eventId = filter_var($input['id'] ?? null, FILTER_SANITIZE_SPECIAL_CHARS); // Allow underscore in ID
+            $newStatus = $input['status'] ?? null;
+
+            if (!$eventId || !in_array($newStatus, [STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED])) {
+                throw new Exception('Invalid event ID or status provided.');
+            }
+
+             // Find event using the map
+             if (!isset($eventMap[$eventId])) {
+                throw new Exception('Event not found for status update.');
+             }
+             $eventIndex = array_search($eventId, array_keys($eventMap));
+
+            $data['events'][$eventIndex]['status'] = $newStatus;
+
+             // Auto-apply department color if approving and no color exists
+             if ($newStatus === STATUS_APPROVED && !isset($data['events'][$eventIndex]['color'])) {
+                 $deptId = $data['events'][$eventIndex]['departmentId'] ?? null;
+                 $deptColor = isset($departmentMap[$deptId]) ? $departmentMap[$deptId]['color'] : '#5c6bc0';
+                 $data['events'][$eventIndex]['color'] = $deptColor;
+                 $data['events'][$eventIndex]['textColor'] = '#ffffff';
+             }
+
+            if (writeData(DATA_FILE, $data)) {
+                echo json_encode(['success' => true, 'message' => 'Event status updated successfully']);
+            } else {
+                throw new Exception('Failed to update event status.');
+            }
+            break;
+
+        case 'deleteEvent':
+            $data = $appData;
+            $eventId = filter_var($input['id'] ?? null, FILTER_SANITIZE_SPECIAL_CHARS);
+
+            if (!$eventId) throw new Exception('Invalid event ID provided.');
+
+            // Find event using the map
+            if (!isset($eventMap[$eventId])) {
+                throw new Exception('Event not found for deletion.');
+            }
+            $existingEvent = $eventMap[$eventId];
+            $eventIndex = array_search($eventId, array_keys($eventMap));
+
+            // Permission Check
+             $canDelete = ($CURRENT_USER_ROLE === ROLE_MANAGER) ||
+                          ($CURRENT_USER_ROLE === ROLE_EVALUATOR) ||
+                          (($existingEvent['proposerId'] ?? null) === $CURRENT_USER_ID &&
+                           ($existingEvent['status'] ?? '') !== STATUS_APPROVED);
+             if (!$canDelete) {
+                 throw new Exception('You do not have permission to delete this event.');
+             }
+
+            // Remove the event
+            array_splice($data['events'], $eventIndex, 1);
+
+            if (writeData(DATA_FILE, $data)) {
+                 echo json_encode(['success' => true, 'message' => 'Event deleted successfully']);
+            } else {
+                 throw new Exception('Failed to delete event.');
+            }
+            break;
+
+        case 'manageDepartments':
+            if ($CURRENT_USER_ROLE !== ROLE_MANAGER) throw new Exception('Access Denied');
+            $data = $appData;
+            $departmentsInput = $input['departments'] ?? [];
+            $cleanDepartments = [];
+            if (is_array($departmentsInput)) {
+                foreach ($departmentsInput as $dept) {
+                     $name = sanitizeString($dept['name'] ?? '');
+                     $color = sanitizeString($dept['color'] ?? ''); // Basic sanitization, could add hex validation
+                     $id = sanitizeString($dept['id'] ?? null); // Allow existing IDs
+                     if (!empty($name) && !empty($color)) {
+                         $cleanDepartments[] = [
+                             'id' => ($id && !str_starts_with($id, 'new_')) ? $id : ('d_' . time() . rand(100, 999)),
+                             'name' => $name,
+                             'color' => $color
+                         ];
+                     }
+                }
+            }
+            $data['departments'] = $cleanDepartments;
+            if (writeData(DATA_FILE, $data)) {
+                 echo json_encode(['success' => true, 'message' => 'Departments updated successfully']);
+            } else {
+                throw new Exception('Failed to update departments.');
+            }
+            break;
+
+        case 'manageUsers':
+            if ($CURRENT_USER_ROLE !== ROLE_MANAGER) throw new Exception('Access Denied');
+            $users = $usersData; // Use initial user data
+            $sub_action = $input['sub_action'] ?? '';
+            $clientUser = $input['user'] ?? null;
+            $message = '';
+
+            switch ($sub_action) {
+                case 'delete':
+                    $userIdToDelete = sanitizeString($clientUser['id'] ?? null);
+                    if (!$userIdToDelete) throw new Exception('User ID required');
+                    if ($userIdToDelete === $CURRENT_USER_ID) throw new Exception('You cannot delete your own account.');
+
+                    $initialCount = count($users);
+                    $users = array_filter($users, fn($u) => ($u['id'] ?? null) !== $userIdToDelete);
+
+                    if (count($users) === $initialCount) {
+                         throw new Exception('User not found for deletion.');
+                    }
+                    $message = 'User deleted successfully';
+                    break;
+
+                case 'save':
+                    $cleanUser = [];
+                    $cleanUser['id'] = sanitizeString($clientUser['id'] ?? null);
+                    $cleanUser['username'] = trim(sanitizeString($clientUser['username'] ?? ''));
+                    $cleanUser['displayName'] = trim(sanitizeString($clientUser['displayName'] ?? ''));
+                    $cleanUser['password'] = $clientUser['password'] ?? null; // Password is not sanitized here, handled by password_hash
+                    $cleanUser['role'] = sanitizeString($clientUser['role'] ?? ROLE_VIEWER);
+                    if (!in_array($cleanUser['role'], [ROLE_MANAGER, ROLE_EVALUATOR, ROLE_PROPOSER, ROLE_VIEWER])) {
+                        $cleanUser['role'] = ROLE_VIEWER; // Default to viewer if invalid role
+                    }
+                    $cleanUser['departmentId'] = sanitizeString($clientUser['departmentId'] ?? null) ?: null;
+
+                    // Sanitize permissions
+                    $perms = $clientUser['permissions'] ?? [];
+                    $cleanUser['permissions'] = [
+                         'view_all_depts' => !empty($perms['view_all_depts']),
+                         'view_depts' => is_array($perms['view_depts'] ?? []) ? array_map('sanitizeString', $perms['view_depts']) : [],
+                         'view_all_users' => !empty($perms['view_all_users']),
+                         'view_users' => is_array($perms['view_users'] ?? []) ? array_map('sanitizeString', $perms['view_users']) : []
+                    ];
+
+                    if (empty($cleanUser['username'])) throw new Exception('Username is required');
+                    if (empty($cleanUser['displayName'])) throw new Exception('Display Name is required');
+
+                    $isEditing = !empty($cleanUser['id']);
+                    $userIndex = false;
+                    if ($isEditing) {
+                        // Find index using existing ID
+                        foreach ($users as $index => $u) {
+                             if (($u['id'] ?? null) === $cleanUser['id']) {
+                                 $userIndex = $index;
+                                 break;
+                             }
+                        }
+                        if ($userIndex === false) throw new Exception('User not found for editing.');
+                    } else {
+                         // Check for duplicate username on creation
+                         foreach ($users as $u) {
+                             if (($u['username'] ?? '') === $cleanUser['username']) {
+                                 throw new Exception('Username already exists.');
+                             }
+                         }
+                         if (empty($cleanUser['password'])) throw new Exception('Password is required for new users.');
+                    }
+
+                    if ($isEditing) {
+                        // Update existing user
+                        $users[$userIndex]['username'] = $cleanUser['username'];
+                        $users[$userIndex]['displayName'] = $cleanUser['displayName'];
+                        $users[$userIndex]['role'] = $cleanUser['role'];
+                        $users[$userIndex]['departmentId'] = $cleanUser['departmentId'];
+                        $users[$userIndex]['permissions'] = $cleanUser['permissions'];
+                        if (!empty($cleanUser['password'])) {
+                            $users[$userIndex]['password_hash'] = password_hash($cleanUser['password'], PASSWORD_DEFAULT);
+                        }
+                        $message = 'User updated successfully';
+                    } else {
+                        // Create new user
+                        $newUser = $cleanUser;
+                        $newUser['id'] = 'u_' . time() . '_' . rand(100, 999);
+                        $newUser['password_hash'] = password_hash($newUser['password'], PASSWORD_DEFAULT);
+                        unset($newUser['password']);
+                        $users[] = $newUser;
+                        $message = 'User added successfully';
+                    }
+                    break;
+                default:
+                    throw new Exception('Invalid sub-action for user management');
+            }
+
+            // Write updated user data
+            if (writeData(USERS_FILE, array_values($users))) {
+                 // Reread users to send back clean list without hashes
+                 $updatedUsersList = readData(USERS_FILE) ?? [];
+                 $outputUsers = array_map(function($user){ unset($user['password_hash']); return $user; }, $updatedUsersList);
+                 echo json_encode(['success' => true, 'message' => $message, 'data' => $outputUsers]);
+            } else {
+                throw new Exception('Failed to save user data.');
+            }
+            break;
+
+        case 'reportIssue':
+            $issues = $issuesData; // Use initial data
+            $issueText = trim(sanitizeString($input['text'] ?? '', false)); // Allow basic punctuation etc.
+            if (empty($issueText)) throw new Exception("Issue text cannot be empty.");
+
+            $newIssue = [
+                'id' => time(),
+                'userId' => $CURRENT_USER_ID,
+                'userName' => $_SESSION['displayName'],
+                'text' => $issueText, // Store the sanitized text
+                'timestamp' => date('c'), // ISO 8601 format
+                'status' => 'new'
+            ];
+            $issues[] = $newIssue;
+
+            if (writeData(ISSUES_FILE, $issues)) {
+                 echo json_encode(['success' => true, 'message' => 'Issue reported successfully.']);
+            } else {
+                 throw new Exception('Failed to save issue report.');
+            }
+            break;
+
+        case 'getIssues':
+            if ($CURRENT_USER_ROLE !== ROLE_MANAGER) throw new Exception('Access Denied');
+            $issues = $issuesData; // Use initial data
+            // Sort by timestamp descending
+            usort($issues, fn($a, $b) => ($b['timestamp'] ?? '') <=> ($a['timestamp'] ?? ''));
+            echo json_encode(['success' => true, 'data' => $issues]);
+            break;
+
+        default:
+            http_response_code(400); // Bad Request
+            throw new Exception('Invalid Action Specified');
+    }
+
+} catch (Exception $e) {
+    http_response_code(isset($e->code) && is_int($e->code) ? $e->code : 500); // Use exception code if available, else 500
+    // Log the detailed error on the server
+    error_log("API Error: " . $e->getMessage() . "\nTrace: " . $e->getTraceAsString());
+    // Send a generic error message to the client
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]); // Send specific message for now, maybe generalize later
+}
+
+?>
+
+
+app.js
+
+/**
+ * Weekly Calendar Application - 
+ * - Persian UI Translation
+ * - Corrected Timezone Handling (Treats input as Tehran time)
+ * - Toast Notifications
+ * - "Today" Button & Mini-Calendar Picker
+ * - Click-to-Create Basic
+ * - Mobile Indicator Fix
+ * - Robust Mobile Header Height Calc
+ * - Basic State Management
+ * - Constants for Roles/Status
+ * - Bug Fixes & Refinements
+ */
+document.addEventListener('DOMContentLoaded', () => {
+
+    // --- Constants ---
+    const WEEK_DAYS_PERSIAN = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'];
+    const ROLES = Object.freeze({ MANAGER: 'manager', EVALUATOR: 'evaluator', PROPOSER: 'proposer', VIEWER: 'viewer' });
+    const STATUS = Object.freeze({ APPROVED: 'approved', PENDING: 'pending', REJECTED: 'rejected' });
+    const MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+    // --- Basic State Management ---
+    let appState = {
+        fullData: { settings: {}, events: [], holidays: [], departments: [], users: [] },
+        currentView: 'grid',
+        currentWeekStartDate: new Date(), // Will be set correctly on load
+        timeIndicatorInterval: null,
+        pollingInterval: null,
+        lastFetchedDataString: '',
+        initialServerTime: null, // For accurate time estimation
+        initialClientTime: null,
+        mobileViewConfig: { dayCount: 7, hourZoom: 2 },
+        gestureState: { active: false, type: null, startX: 0, startY: 0, lastDist: 0, isSwipe: false, swipeStartX: 0, swipeStartY: 0, swipeMinDist: 50 },
+        miniCalendar: { currentMonth: new Date(), pickerOpen: false }
+    };
+
+    // --- Element Selectors ---
+    const calendarGridContainer = document.getElementById('calendar-grid-container');
+    const calendarListContainer = document.getElementById('calendar-list-container');
+    const calendarTitle = document.getElementById('calendar-title');
+    const loader = document.getElementById('loader-overlay');
+    const legendBtn = document.getElementById('color-legend-btn');
+    const legendPopup = document.getElementById('color-legend-popup');
+    const viewToggleBtn = document.getElementById('view-toggle-btn');
+    const prevWeekBtn = document.getElementById('prev-week-btn');
+    const nextWeekBtn = document.getElementById('next-week-btn');
+    const todayBtn = document.getElementById('today-btn'); // New
+    const mainHeader = document.querySelector('.main-header'); // For height calculation
+
+    // Mini Calendar Elements (New)
+    const miniCalendarPopup = document.getElementById('mini-calendar');
+    const miniCalendarHeader = document.getElementById('mini-calendar-header');
+    const miniCalendarDays = document.getElementById('mini-calendar-days');
+    const miniCalPrevBtn = document.getElementById('mini-calendar-prev');
+    const miniCalNextBtn = document.getElementById('mini-calendar-next');
+
+    // FAB Menu Elements
+    const fabContainer = document.querySelector('.fab-container');
+    const fabMainBtn = document.getElementById('fab-main-btn');
+    const fabMenu = document.getElementById('fab-menu');
+
+    // Event Modal Elements
+    const eventModal = document.getElementById('event-modal');
+    const eventModalTitle = document.getElementById('event-modal-title');
+    const eventForm = document.getElementById('event-form');
+    const eventIdInput = document.getElementById('eventId');
+    const eventTitleInput = document.getElementById('eventTitle');
+    const eventByInput = document.getElementById('eventBy');
+    const eventForInput = document.getElementById('eventFor');
+    const eventGoalGroup = document.getElementById('event-goal-group');
+    const eventGoalInput = document.getElementById('eventGoal');
+    const isAllDayCheckbox = document.getElementById('isAllDay');
+    const startDaySelect = document.getElementById('startDay');
+    const startTimeInput = document.getElementById('startTime');
+    const endDaySelect = document.getElementById('endDay');
+    const endTimeInput = document.getElementById('endTime');
+    const approvalActions = document.getElementById('approval-actions');
+    const approveEventBtn = document.getElementById('approve-event-btn');
+    const rejectEventBtn = document.getElementById('reject-event-btn');
+    const deleteEventBtn = document.getElementById('delete-event-btn');
+    const saveEventBtn = document.getElementById('save-event-btn');
+    const cancelEventBtn = document.getElementById('cancel-event-btn');
+    const managerColorInputs = document.getElementById('event-colors-manager');
+
+    // Settings Modal Elements
+    const settingsModal = document.getElementById('settings-modal');
+    const mainHeaderInput = document.getElementById('mainHeader');
+    const weekSelector = document.getElementById('weekSelector');
+
+    // Depts Modal Elements
+    const deptsModal = document.getElementById('depts-modal');
+    const deptsListEditor = document.getElementById('depts-list-editor');
+
+    // Users Modal Elements
+    const usersModal = document.getElementById('users-modal');
+    const usersListEditor = document.getElementById('users-list-editor');
+
+    // Issue Modals Elements
+    const issueModal = document.getElementById('issue-modal');
+    const issueTextInput = document.getElementById('issue-text');
+    const viewIssuesModal = document.getElementById('view-issues-modal');
+    const issuesListContainer = document.getElementById('issues-list-container');
+
+    // Toast Container (New)
+    const toastContainer = document.getElementById('toast-container');
+
+    // --- Helper Functions ---
+    const showLoader = () => loader.classList.remove('hidden');
+    const hideLoader = () => loader.classList.add('hidden');
+    const toPersian = (str) => String(str).replace(/[0-9]/g, (w) => '۰۱۲۳۴۵۶۷۸۹'[+w]);
+    const timeToMinutes = (timeStr) => {
+        if (!timeStr) return 0;
+        const parts = String(timeStr).split(':');
+        const h = parseInt(parts[0] || '0', 10);
+        const m = parseInt(parts[1] || '0', 10);
+        return (h === 24 && m === 0) ? 24 * 60 : h * 60 + m; // Handle 24:00
+    };
+    const formatDate = (date) => { // Returns "YYYY-MM-DD"
+        if (!date || isNaN(date)) return '';
+        try {
+            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        } catch (e) { console.error("FormatDate Error:", e); return ''; }
+    };
+    const formatTime = (timeStr) => { // Ensures "HH:MM" or returns "00:00" on error, keeps "24:00"
+        if (!timeStr) return "00:00";
+        const trimmedTime = String(timeStr).trim();
+        if (trimmedTime === '24:00') return '24:00';
+        const parts = trimmedTime.split(':');
+        const hVal = parseInt(parts[0], 10);
+        const mVal = parseInt(parts[1], 10);
+        if (isNaN(hVal) || isNaN(mVal) || hVal < 0 || hVal >= 24 || mVal < 0 || mVal >= 60) {
+            console.warn("Invalid time format detected, returning 00:00:", timeStr);
+            return "00:00";
+        }
+        return `${String(hVal).padStart(2, '0')}:${String(mVal).padStart(2, '0')}`;
+    };
+
+    /**
+     * Combines a day index (relative to currentWeekStartDate) and time string
+     * into a full ISO 8601 string *with the Tehran timezone offset*,
+     * treating the input time as if it *were* already Tehran time.
+     */
+    const combineDateTime = (dayIndex, timeString) => {
+        try {
+            const dayIdxNum = parseInt(dayIndex, 10);
+            if (isNaN(dayIdxNum) || dayIdxNum < 0 || dayIdxNum > 6) return null;
+
+            // 1. Get the base date (start of the week, already local timezone but represents Tehran date)
+            const baseDate = new Date(appState.currentWeekStartDate);
+
+            // 2. Calculate the target date by adding days
+            baseDate.setDate(baseDate.getDate() + dayIdxNum);
+            const targetDateStr = formatDate(baseDate); // "YYYY-MM-DD"
+
+            // 3. Format the time part
+            const time = formatTime(timeString); // "HH:MM" or "24:00"
+
+            // 4. Get the *fixed* Tehran offset (e.g., "+03:30") from the constant
+            const offset = TEHRAN_TIMEZONE_OFFSET || '+03:30'; // Fallback just in case
+
+            // 5. Construct the final ISO string
+            if (time === "24:00") {
+                // Special case for 24:00 - MUST be sent exactly like this
+                return `${targetDateStr}T24:00:00${offset}`;
+            } else {
+                return `${targetDateStr}T${time}:00${offset}`; // Add seconds ":00"
+            }
+        } catch (e) {
+             console.error("combineDateTime Error:", e, {dayIndex, timeString});
+             showToast("خطا در ساخت تاریخ و زمان.", 'error'); // Persian Text
+             return null;
+        }
+    };
+
+    /**
+     * Calculates the day index (0-6) relative to currentWeekStartDate
+     * from a full ISO date-time string.
+     */
+    const getDayIndexFromDateTime = (dateTimeString) => {
+         try {
+             const eventDate = new Date(dateTimeString); // Browser parses ISO string correctly
+             if (isNaN(eventDate)) return 0;
+
+             const startOfWeek = new Date(appState.currentWeekStartDate);
+             startOfWeek.setHours(0, 0, 0, 0); // Ensure start of the day
+
+             // Get event date's start of day in the *same* timezone context
+             const eventDateStartOfDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
+
+             const startOfWeekMS = startOfWeek.getTime();
+             const eventDateStartOfDayMS = eventDateStartOfDay.getTime();
+
+             // Calculate difference in days
+             const diffTime = eventDateStartOfDayMS - startOfWeekMS;
+             const diffDays = Math.round(diffTime / MS_PER_DAY);
+
+             return Math.max(0, Math.min(6, diffDays)); // Clamp between 0 and 6
+         } catch (e) {
+             console.error("getDayIndexFromDateTime Error:", e, dateTimeString);
+             return 0; // Fallback
+         }
+    };
+
+    /**
+     * Gets the day index (0-6, Saturday=0) and time parts (hour, minute)
+     * for a given Date object, specifically in the 'Asia/Tehran' timezone.
+     */
+    function getTehranParts(dateObj) {
+         try {
+             const formatter = new Intl.DateTimeFormat('en-CA-u-hc-h23', {
+                 timeZone: 'Asia/Tehran',
+                 year: 'numeric', month: 'numeric', day: 'numeric',
+                 hour: 'numeric', minute: 'numeric', weekday: 'long'
+             });
+             const parts = formatter.formatToParts(dateObj);
+             const getValue = (type) => parts.find(p => p.type === type)?.value;
+
+             const dayName = getValue('weekday');
+             const dayMap = {'Sunday': 0, 'Monday': 1, 'Tuesday': 2, 'Wednesday': 3, 'Thursday': 4, 'Friday': 5, 'Saturday': 6};
+             const appDayIndex = (dayMap[dayName] + 1) % 7; // Convert to Sat=0
+
+             let hour = parseInt(getValue('hour'), 10);
+             if (hour === 24) hour = 0; // Intl might return 24 for midnight
+
+             return { dayIndex: appDayIndex, hour: hour, minute: parseInt(getValue('minute'), 10) };
+         } catch (e) {
+             console.warn("Intl.DateTimeFormat failed for Tehran time, using local time as fallback.", e);
+             // Fallback to browser's local time (might be inaccurate for indicator)
+             return { dayIndex: (dateObj.getDay() + 1) % 7, hour: dateObj.getHours(), minute: dateObj.getMinutes() };
+         }
+    }
+
+    /**
+     * Shows a toast notification.
+     * type: 'success', 'error', 'warning', 'info' (defaults to 'info')
+     */
+    function showToast(message, type = 'info', duration = 3000) {
+        if (!toastContainer) return;
+        const toast = document.createElement('div');
+        toast.className = `toast toast-${type}`;
+        toast.textContent = message;
+        toastContainer.appendChild(toast);
+
+        // Trigger fade in animation
+        requestAnimationFrame(() => {
+            toast.classList.add('show');
+        });
+
+        // Set timeout to remove the toast
+        setTimeout(() => {
+            toast.classList.remove('show');
+            // Remove from DOM after transition ends
+            toast.addEventListener('transitionend', () => {
+                if (toast.parentNode) {
+                    toast.parentNode.removeChild(toast);
+                }
+            }, { once: true });
+        }, duration);
+    }
+
+
+    // ===================================================================
+    // API Call Function
+    // ===================================================================
+    async function apiCall(action, data = null, method = 'POST') {
+        let shouldShowLoader = !(action === 'getData' && appState.pollingInterval); // Only hide loader during polling checks
+        if (shouldShowLoader) showLoader();
+        try {
+            const options = { method: method, headers: { 'Content-Type': 'application/json' }, };
+            let url = `api.php?action=${action}`;
+            if (method === 'POST') { if (data) { options.body = JSON.stringify(data); } }
+            else if (method === 'GET' && data) { url += `&${new URLSearchParams(data).toString()}`; }
+
+            const response = await fetch(url, options);
+            const responseText = await response.text();
+             if (!response.ok) {
+                 console.error(`HTTP error! status: ${response.status}. Response:`, responseText);
+                 let errorMsg = `خطای HTTP ${response.status}`; // Persian Text
+                 try { const errorJson = JSON.parse(responseText); errorMsg = errorJson.message || errorMsg; } catch(e) {}
+                 throw new Error(errorMsg);
+             }
+             const result = JSON.parse(responseText); // Assume valid JSON if response.ok
+             if (!result.success) {
+                 console.error('API Error Payload:', result);
+                 throw new Error(result.message || 'خطای ناشناخته از سرور'); // Persian Text
+             }
+            return result;
+        } catch (error) {
+            console.error('API Call Error:', action, error);
+            // Don't show alert for polling errors, just log them
+            if (shouldShowLoader) {
+                showToast(`خطا در ارتباط با سرور: ${error.message}`, 'error'); // Persian Text
+            }
+            return null; // Indicate failure
+        } finally {
+             if (shouldShowLoader) hideLoader();
+        }
+    }
+
+    // ===================================================================
+    // Main Render Logic
+    // ===================================================================
+
+    // Fetches data for the currently set week and re-renders
+    async function fetchAndRenderCurrentWeekData() {
+         const currentWeekStartStr = formatDate(appState.currentWeekStartDate);
+         const wasPolling = appState.pollingInterval; // Store polling state
+         appState.pollingInterval = true; // Temporarily set to prevent loader in apiCall
+         const result = await apiCall('getData', { weekStartDate: currentWeekStartStr }, 'GET');
+         appState.pollingInterval = wasPolling; // Restore polling state
+
+         if (result && result.data) {
+             appState.lastFetchedDataString = JSON.stringify(result.data.events || []); // Update cache check string
+             appState.fullData = result.data; // Update state
+             updateCalendarTitle();
+             renderCurrentView(); // Re-render Grid or List
+             renderColorLegend();
+             startTimeIndicator(); // Restart time indicator for the new week
+         } else {
+             console.error("واکشی داده‌های هفته ناموفق بود."); // Persian Text
+             showToast("خطا در دریافت اطلاعات هفته.", 'error'); // Persian Text
+         }
+    }
+
+    // Initial data load for the application
+    async function loadAndRender() {
+        stopPolling(); // Ensure no polling is running initially
+        const result = await apiCall('getData', null, 'GET'); // Get data for default/saved week
+        if (result && result.data) {
+            appState.lastFetchedDataString = JSON.stringify(result.data.events || []);
+            appState.fullData = result.data;
+
+            // Set the *actual* start date based on server time, ignoring settings.weekStartDate for initial load consistency
+            appState.currentWeekStartDate = getStartDate(); // Uses server time
+
+            // Set initial time references for accurate indicator updates
+            appState.initialServerTime = new Date(CURRENT_SERVER_TIME_ISO);
+            appState.initialClientTime = new Date();
+
+            document.title = appState.fullData.settings?.headerText || "تقویم هفتگی"; // Persian Text
+
+            // Initial render
+            updateCalendarTitle();
+            renderCurrentView();
+            renderColorLegend();
+            startTimeIndicator();
+            calculateMobileHeaderHeight(); // Calculate mobile header height after initial render
+        } else {
+             console.error("لود اولیه داده‌ها ناموفق بود."); // Persian Text
+             showToast("خطا در بارگذاری اولیه اطلاعات.", 'error', 5000); // Persian Text
+        }
+        startPolling(); // Start polling after successful initial load
+    }
+
+    // Background polling for automatic updates
+    function startPolling() {
+        stopPolling();
+        console.log("Polling started...");
+        appState.pollingInterval = setInterval(async () => {
+            const currentWeekStartStr = formatDate(appState.currentWeekStartDate);
+            // apiCall will automatically suppress the loader because appState.pollingInterval is true
+            const result = await apiCall('getData', { weekStartDate: currentWeekStartStr }, 'GET');
+            if (result && result.data) {
+                const newDataString = JSON.stringify(result.data.events || []);
+                // Only re-render if event data has actually changed
+                if (newDataString !== appState.lastFetchedDataString) {
+                    console.log("Data changed, rendering...");
+                    appState.lastFetchedDataString = newDataString;
+                    // Update relevant parts of the state
+                    appState.fullData.events = result.data.events || [];
+                    appState.fullData.users = result.data.users || []; // Update users too for permission checks etc.
+                    appState.fullData.departments = result.data.departments || [];
+                    appState.fullData.holidays = result.data.holidays || [];
+                    // Note: We don't overwrite settings here to avoid external changes messing with current navigation
+                    renderCurrentView(); // Re-render the visible view
+                    renderColorLegend(); // Update legend if departments changed
+                }
+            } else {
+                 console.warn("Polling fetch failed.");
+                 // Optionally stop polling on error: stopPolling();
+            }
+        }, 10000); // Poll every 10 seconds
+    }
+
+    function stopPolling() {
+        if (appState.pollingInterval) {
+            clearInterval(appState.pollingInterval);
+            appState.pollingInterval = null;
+            console.log("Polling stopped.");
+        }
+    }
+
+    // Renders either the Grid or List view based on current state
+    function renderCurrentView() {
+        if (appState.currentView === 'grid') {
+            calendarGridContainer.style.display = 'block';
+            calendarListContainer.style.display = 'none';
+            renderGridView();
+        } else {
+            calendarGridContainer.style.display = 'none';
+            calendarListContainer.style.display = 'block';
+            renderListView();
+        }
+        updateTimeIndicator(); // Update indicator position after every render
+    }
+
+    // Updates the main header title with the current week's date range
+    function updateCalendarTitle() {
+        const start = new Date(appState.currentWeekStartDate);
+        const end = new Date(start);
+        end.setDate(start.getDate() + 6);
+
+        const formatterYear = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long', year: 'numeric' });
+        const formatterMonth = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' });
+
+        let titleText = "";
+        try {
+            if (start.getFullYear() === end.getFullYear()) {
+                titleText = `(${toPersian(formatterMonth.format(start))} - ${toPersian(formatterYear.format(end))})`;
+            } else {
+                titleText = `(${toPersian(formatterYear.format(start))} - ${toPersian(formatterYear.format(end))})`;
+            }
+        } catch (e) {
+            console.error("Error formatting date title:", e);
+            titleText = "انتخاب هفته"; // Persian Text - Fallback
+        }
+        calendarTitle.textContent = titleText;
+    }
+
+    // Renders the main Grid view (desktop or mobile)
+    function renderGridView() {
+        calendarGridContainer.innerHTML = ''; // Clear previous grid
+        const holidays = Array.isArray(appState.fullData.holidays) ? appState.fullData.holidays : [];
+
+        if (window.matchMedia("(max-width: 768px)").matches) {
+            document.body.classList.add('mobile-view');
+            createMobileGrid(holidays);
+            updateMobileViewCSS(); // Apply mobile zoom settings
+        } else {
+            document.body.classList.remove('mobile-view');
+            createDesktopGrid(holidays);
+        }
+
+        // Generate temporary holiday "events" for display
+        const holidayEvents = holidays.map(h => {
+             const dayOffset = parseInt(h.day, 10);
+             if (isNaN(dayOffset) || dayOffset < 0 || dayOffset > 6) return null;
+             const holidayDate = new Date(appState.currentWeekStartDate);
+             holidayDate.setDate(holidayDate.getDate() + dayOffset);
+             const dateStr = formatDate(holidayDate);
+             // Use combineDateTime to ensure correct offset for comparison later if needed
+             const startDT = combineDateTime(dayOffset, "00:00");
+             const endDT = combineDateTime(dayOffset, "24:00");
+             if (!startDT || !endDT) return null; // Skip if combineDateTime fails
+
+             return {
+                id: `h-${h.day}`, title: h.occasion, isAllDay: true,
+                startDateTime: startDT, endDateTime: endDT,
+                color: '#e57373', textColor: 'white', status: STATUS.APPROVED, isHoliday: true
+            };
+        }).filter(Boolean); // Remove null entries
+
+        const validEvents = Array.isArray(appState.fullData.events) ? appState.fullData.events : [];
+        const allEventsToRender = validEvents.concat(holidayEvents);
+
+        renderAllEvents(allEventsToRender);
+        applySmartContent(); // Adjust content based on size
+        createOrUpdateTimeIndicator(); // Add/update time indicator line
+    }
+
+    // Creates the HTML structure for the Desktop grid
+    function createDesktopGrid(holidays) {
+        calendarGridContainer.innerHTML = `
+            <div class="calendar-grid">
+                <div class="grid-header">
+                    <div class="header-corner"></div>
+                    <div class="header-allday">تمام روز</div>
+                    <div class="header-timeline"></div>
+                </div>
+                <div class="grid-body"></div>
+            </div>`;
+        const timelineHeader = calendarGridContainer.querySelector('.header-timeline');
+        timelineHeader.innerHTML = Array.from({ length: 48 }, (_, i) =>
+            `<div class="time-label">${i % 2 === 0 ? toPersian(Math.floor(i / 2)) + ':۰۰' : ''}</div>`
+        ).join('');
+
+        const gridBody = calendarGridContainer.querySelector('.grid-body');
+        const startDate = appState.currentWeekStartDate;
+        for (let j = 0; j < 7; j++) {
+            const currentDate = new Date(startDate);
+            currentDate.setDate(startDate.getDate() + j);
+            const dateString = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(currentDate);
+            const dayRow = document.createElement('div');
+            dayRow.className = 'day-row';
+            dayRow.dataset.dayIndex = j;
+            if (holidays.some(h => parseInt(h.day, 10) === j)) dayRow.classList.add('is-holiday');
+
+            // Add invisible time slots for click detection
+            let timeSlotsHTML = '';
+            for (let slot = 0; slot < 48; slot++) {
+                timeSlotsHTML += `<div class="time-slot" data-slot="${slot}" style="--slot-index: ${slot};"></div>`;
+            }
+
+            dayRow.innerHTML = `
+                <div class="day-label"><span>${WEEK_DAYS_PERSIAN[j]}</span><span class="date">${toPersian(dateString)}</span></div>
+                <div class="all-day-cell" data-day-index="${j}"></div>
+                <div class="timeline-cell" data-day-index="${j}">${timeSlotsHTML}</div>
+            `;
+            gridBody.appendChild(dayRow);
+        }
+    }
+
+    // Creates the HTML structure for the Mobile grid
+    function createMobileGrid(holidays) {
+        calendarGridContainer.innerHTML = `
+            <div class="mobile-grid">
+                <div class="mobile-time-axis"></div>
+                <div class="mobile-days-container"></div>
+            </div>`;
+        const timeAxis = calendarGridContainer.querySelector('.mobile-time-axis');
+        timeAxis.innerHTML = `<div class="time-axis-corner"></div><div class="time-label-mobile all-day-header">تمام روز</div>`; // Persian Text
+        for (let i = 0; i < 24; i++) {
+             const label = document.createElement('div');
+             label.className = 'time-label-mobile';
+             label.dataset.hour = i;
+             label.textContent = `${toPersian(i)}:۰۰`;
+             timeAxis.appendChild(label);
+        }
+
+        const daysContainer = calendarGridContainer.querySelector('.mobile-days-container');
+        const startDate = appState.currentWeekStartDate;
+        for (let j = 0; j < 7; j++) {
+            const currentDate = new Date(startDate);
+            currentDate.setDate(startDate.getDate() + j);
+            const dateString = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long' }).format(currentDate);
+            const dayColumn = document.createElement('div');
+            dayColumn.className = 'day-column';
+            dayColumn.dataset.dayIndex = j;
+            if (holidays.some(h => parseInt(h.day, 10) === j)) dayColumn.classList.add('is-holiday');
+
+            // Add invisible time slots for click detection
+            let timeSlotsHTML = '';
+            for (let slot = 0; slot < 48; slot++) {
+                // In mobile, slots are vertical blocks
+                timeSlotsHTML += `<div class="time-slot" data-slot="${slot}" style="--slot-index: ${slot};"></div>`;
+            }
+
+            dayColumn.innerHTML = `
+                <div class="day-label"><span>${WEEK_DAYS_PERSIAN[j]}</span><span class="date">${toPersian(dateString)}</span></div>
+                <div class="all-day-cell" data-day-index="${j}"></div>
+                <div class="timeline-cell" data-day-index="${j}">${timeSlotsHTML}</div>
+            `;
+            daysContainer.appendChild(dayColumn);
+        }
+    }
+
+    // Applies CSS variables for mobile zoom levels
+    function updateMobileViewCSS() {
+        const grid = document.querySelector('.mobile-grid');
+        if (!grid) return;
+        const timeAxis = grid.querySelector('.mobile-time-axis');
+
+        grid.style.setProperty('--mobile-day-count', appState.mobileViewConfig.dayCount);
+        grid.style.setProperty('--mobile-hour-zoom', appState.mobileViewConfig.hourZoom);
+
+        // Show/hide hour labels based on zoom
+        const labels = timeAxis.querySelectorAll('.time-label-mobile[data-hour]');
+        labels.forEach(label => {
+            const hour = parseInt(label.dataset.hour, 10);
+            let show = false;
+            const zoom = appState.mobileViewConfig.hourZoom;
+            if (zoom === 1) show = (hour % 3 === 0);      // Every 3 hours
+            else if (zoom === 2) show = (hour % 2 === 0); // Every 2 hours
+            else show = true;                             // Every hour (levels 3 & 4)
+            label.style.display = show ? 'flex' : 'none';
+        });
+    }
+
+    // Processes events (calculates chunks for multi-day) and renders them
+    function renderAllEvents(events) {
+        let allDayEventsByDay = Array(7).fill(null).map(() => []);
+        let timedEventsByDay = Array(7).fill(null).map(() => []);
+
+        const weekStart = new Date(appState.currentWeekStartDate);
+        weekStart.setHours(0,0,0,0);
+        const weekStartMS = weekStart.getTime();
+        const weekEnd = new Date(weekStart);
+        weekEnd.setDate(weekEnd.getDate() + 7);
+        const weekEndMS = weekEnd.getTime();
+
+        for (const event of events) {
+             try {
+                 const eventStartDT = new Date(event.startDateTime);
+                 let eventEndDT;
+                 const isEndTime24 = event.endDateTime.includes('T24:00');
+
+                 if (isEndTime24) {
+                     // For Date object creation, use 23:59:59 of the *same day*
+                     const datePart = event.endDateTime.substring(0, 10);
+                     const offsetPart = event.endDateTime.substring(19);
+                     eventEndDT = new Date(`${datePart}T23:59:59${offsetPart || ''}`);
+                     // Now add 1 second to push it to midnight of the next day *for comparison*
+                     eventEndDT.setTime(eventEndDT.getTime() + 1000);
+                 } else {
+                     eventEndDT = new Date(event.endDateTime);
+                 }
+
+                 if (isNaN(eventStartDT) || isNaN(eventEndDT)) {
+                     console.warn("Invalid event date, skipping:", event.id, event.title);
+                     continue;
+                 }
+
+                const effectiveStartMS = Math.max(weekStartMS, eventStartDT.getTime());
+                let effectiveEndMS = Math.min(weekEndMS, eventEndDT.getTime());
+
+                let startDay = Math.floor((effectiveStartMS - weekStartMS) / MS_PER_DAY);
+                // Adjust endDay calculation for precision, subtracting 1ms before floor
+                let endDay = Math.floor((effectiveEndMS - weekStartMS - 1) / MS_PER_DAY);
+
+                startDay = Math.max(0, startDay);
+                endDay = Math.min(6, endDay);
+
+                if (endDay < startDay) continue; // Event doesn't fall in this week segment
+
+                for (let day = startDay; day <= endDay; day++) {
+                    const chunk = { ...event, day: day };
+
+                    // isMultiDayPart check
+                    const eventStartDateOnly = new Date(eventStartDT.getFullYear(), eventStartDT.getMonth(), eventStartDT.getDate()).getTime();
+                    let comparisonEndDT = isEndTime24 ? new Date(eventEndDT.getTime() - 1000) : eventEndDT; // Use day before for 24:00 end
+                    const eventEndDateOnly = new Date(comparisonEndDT.getFullYear(), comparisonEndDT.getMonth(), comparisonEndDT.getDate()).getTime();
+                    chunk.isMultiDayPart = (eventStartDateOnly !== eventEndDateOnly);
+
+                    chunk.isStart = (day === startDay);
+                    chunk.isEnd = (day === endDay);
+
+                    // Calculate 'from' and 'to' times for the chunk
+                    const dayStartMS = weekStartMS + day * MS_PER_DAY;
+                    chunk.from = (chunk.isStart && eventStartDT.getTime() > dayStartMS) ? eventStartDT.toTimeString().substring(0, 5) : "00:00";
+
+                    const dayEndMS = weekStartMS + (day + 1) * MS_PER_DAY;
+                    let chunkEndTimeStr = comparisonEndDT.toTimeString().substring(0, 5);
+                    if (isEndTime24) chunkEndTimeStr = "24:00"; // Use "24:00" if original was T24
+                    else if (chunkEndTimeStr === "00:00" && comparisonEndDT.getTime() > eventStartDT.getTime()) chunkEndTimeStr = "24:00"; // Midnight end becomes 24:00
+
+                    chunk.to = (chunk.isEnd && eventEndDT.getTime() <= dayEndMS) ? chunkEndTimeStr : "24:00"; // Use <= for dayEndMS comparison
+
+                    if(event.isAllDay) {
+                        chunk.from = "00:00"; chunk.to = "24:00";
+                        allDayEventsByDay[day].push(chunk);
+                    } else {
+                        timedEventsByDay[day].push(chunk);
+                    }
+                }
+             } catch (e) { console.error("Error processing event:", event?.id, event?.title, e); }
+        }
+
+        // Render chunks into the DOM
+        for (let day = 0; day < 7; day++) {
+            const dayContainer = document.querySelector(`[data-day-index="${day}"]`);
+            if (!dayContainer) continue;
+            const allDayCell = dayContainer.querySelector('.all-day-cell');
+            if (allDayEventsByDay[day].length > 0) {
+                allDayCell.style.setProperty('--event-count', allDayEventsByDay[day].length);
+                allDayEventsByDay[day].forEach(evt => createEventDiv(evt, allDayCell, true));
+            }
+            const timelineCell = dayContainer.querySelector('.timeline-cell');
+            const timedEvents = timedEventsByDay[day].sort((a, b) => timeToMinutes(a.from) - timeToMinutes(b.from));
+            if (timedEvents.length > 0) processAndRenderTimedEvents(timedEvents, timelineCell);
+        }
+         applySmartContent(); // Ensure content fits after rendering
+    }
+
+    // Creates a single event div element
+    function createEventDiv(event, container, isAllDay = false) {
+        const eventDiv = document.createElement('div');
+        eventDiv.className = isAllDay ? 'event-allday' : 'event';
+        eventDiv.classList.add(`status-${event.status || STATUS.APPROVED}`);
+        if (event.status === STATUS.APPROVED) { eventDiv.style.backgroundColor = event.color; eventDiv.style.color = event.textColor || 'white'; }
+        if (event.isMultiDayPart) { eventDiv.dataset.ismultiday = true; if (event.isStart) eventDiv.dataset.isstart = true; if (event.isEnd) eventDiv.dataset.isend = true; }
+
+        let isLocked = false;
+        const userRole = CURRENT_USER.role;
+        // Lock if user is viewer OR if event is approved and user is proposer but not the owner.
+        if (userRole === ROLES.VIEWER || (userRole === ROLES.PROPOSER && event.status === STATUS.APPROVED && event.proposerId !== CURRENT_USER.id)) {
+            isLocked = true;
+        }
+        // Managers and Evaluators can always edit (handled in modal opening)
+
+        if(isLocked) eventDiv.classList.add('event-locked');
+        eventDiv.dataset.event = JSON.stringify(event); // Store full event data
+        eventDiv.dataset.locked = isLocked;
+        container.appendChild(eventDiv);
+        return eventDiv;
+    }
+
+    // Arranges timed events within a day to handle overlaps
+    function processAndRenderTimedEvents(dayEvents, timelineCell) {
+        const isMobile = document.body.classList.contains('mobile-view');
+        dayEvents.forEach(event => { event.start = timeToMinutes(event.from); event.end = timeToMinutes(event.to); });
+
+        let i = 0;
+        while (i < dayEvents.length) {
+            let overlappingGroup = [dayEvents[i]];
+            let maxEnd = dayEvents[i].end;
+            // Find all events overlapping with the current one
+            for (let j = i + 1; j < dayEvents.length; j++) {
+                if (dayEvents[j].start < maxEnd) {
+                    overlappingGroup.push(dayEvents[j]);
+                    maxEnd = Math.max(maxEnd, dayEvents[j].end);
+                } else break;
+            }
+
+            // Simple lane assignment (Greedy algorithm)
+            const lanes = [];
+            overlappingGroup.sort((a,b) => a.start - b.start).forEach(event => {
+                let placed = false;
+                for (let laneIndex = 0; laneIndex < lanes.length; laneIndex++) {
+                    // Check if event can fit in this lane (doesn't overlap with last event in lane)
+                    if (event.start >= lanes[laneIndex][lanes[laneIndex].length - 1].end) {
+                        lanes[laneIndex].push(event);
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) lanes.push([event]); // Start a new lane
+            });
+
+            // Render events in their assigned lanes
+            const totalLanes = lanes.length;
+            lanes.forEach((lane, laneIndex) => {
+                lane.forEach(event => {
+                    const eventWrapper = document.createElement('div');
+                    eventWrapper.className = 'event-wrapper';
+                    const totalMinutesInView = 24 * 60;
+                    const startOffsetMinutes = event.start;
+                    const durationMinutes = Math.max(15, event.end - event.start); // Min duration 15 mins for visibility
+
+                    if (durationMinutes <= 0) return; // Skip zero-duration
+
+                    if (isMobile) {
+                         eventWrapper.style.top = `${(startOffsetMinutes / totalMinutesInView) * 100}%`;
+                         eventWrapper.style.height = `${(durationMinutes / totalMinutesInView) * 100}%`;
+                         eventWrapper.style.left = `${(laneIndex / totalLanes) * 100}%`;
+                         eventWrapper.style.width = `${100 / totalLanes}%`;
+                    } else {
+                        eventWrapper.style.right = `${(startOffsetMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.width = `${(durationMinutes / totalMinutesInView) * 100}%`;
+                        eventWrapper.style.top = `${(laneIndex / totalLanes) * 100}%`;
+                        eventWrapper.style.height = `${100 / totalLanes}%`;
+                    }
+                    createEventDiv(event, eventWrapper, false); // Create the actual event div inside the wrapper
+                    timelineCell.appendChild(eventWrapper);
+                });
+            });
+            i += overlappingGroup.length; // Move index past the processed group
+        }
+    }
+
+    // Adjusts event content display based on available space
+    function applySmartContent() {
+        document.querySelectorAll('.event-allday, .event').forEach(eventDiv => {
+             eventDiv.innerHTML = ''; // Clear previous content
+             const event = JSON.parse(eventDiv.dataset.event);
+             const isAllDay = eventDiv.classList.contains('event-allday');
+             const isHoliday = event.isHoliday;
+             const availableHeight = eventDiv.clientHeight;
+             const availableWidth = eventDiv.clientWidth;
+
+             const hasDeptLabel = !!getDepartmentLabel(event, true);
+             const contentAvailableWidth = availableWidth - (hasDeptLabel ? 20 : 0); // Approx width for vertical label
+
+             let showMeta = !isHoliday && event.isStart && (isAllDay ? (availableHeight >= 45) : (contentAvailableWidth >= 70 && availableHeight >= 45));
+             let ultraCondensed = isAllDay ? (availableHeight < 25) : (contentAvailableWidth < 40 || availableHeight < 25);
+
+             let contentHTML = `<div class="event-title">${(event.isStart || isAllDay || !event.isMultiDayPart) ? (event.title || '') : ''}</div>`; // Show title if it's the start, all-day, or single-day
+             if (showMeta) {
+                 contentHTML += `<div class="event-meta">${event.by || '-'}</div><div class="event-meta">${event.for || '-'}</div>`;
+             }
+
+             const deptLabelHTML = getDepartmentLabel(event); // Get vertical label HTML
+             eventDiv.innerHTML = deptLabelHTML + `<div class="event-content">${contentHTML}</div>`; // Add label first, then content
+
+             if (ultraCondensed) eventDiv.classList.add('event-ultra-condensed');
+             else eventDiv.classList.remove('event-ultra-condensed');
+        });
+    }
+
+    // Generates the vertical department label HTML
+    function getDepartmentLabel(event, checkOnly = false) {
+        if (!event.departmentId || !event.isStart || event.isHoliday) return checkOnly ? false : ''; // Only on start day, not for holidays
+        const shouldShow = true; // Always show if available
+        if (shouldShow) {
+             if (checkOnly) return true;
+             const dept = (appState.fullData.departments || []).find(d => d.id === event.departmentId);
+             if (dept) return `<div class="event-dept vertical">${dept.name}</div>`;
+        }
+        return checkOnly ? false : '';
+    }
+
+    /**
+     * Calculates the Saturday (start of the week) for a given date,
+     * prioritizing the server's current time if no specific date is provided.
+     * Returns a Date object set to 00:00:00 local time.
+     */
+    function getStartDate(gregorianDateStr = null) {
+        let referenceDate;
+        if (gregorianDateStr && /^\d{4}-\d{2}-\d{2}$/.test(gregorianDateStr)) {
+            const [year, month, day] = gregorianDateStr.split('-').map(Number);
+            referenceDate = new Date(year, month - 1, day, 12, 0, 0); // Use noon to avoid DST issues
+        } else {
+            // Use server time as the reference if no specific date given
+            try { referenceDate = new Date(CURRENT_SERVER_TIME_ISO); }
+            catch(e) { referenceDate = new Date(); } // Fallback to client time
+        }
+        if (isNaN(referenceDate)) referenceDate = new Date(); // Final fallback
+
+        const currentDay = referenceDate.getDay(); // 0=Sun, 6=Sat
+        const diffToSat = (currentDay + 1) % 7; // Days to subtract to get to Saturday
+        referenceDate.setDate(referenceDate.getDate() - diffToSat);
+        referenceDate.setHours(0, 0, 0, 0); // Set to start of the day
+        return referenceDate;
+    }
+
+    // Renders the color legend based on user permissions
+    function renderColorLegend() {
+        if (!legendPopup) return;
+        let html = '<h4>راهنمای دپارتمان‌ها</h4><ul>'; // Persian Text
+        const allDepts = Array.isArray(appState.fullData.departments) ? appState.fullData.departments : [];
+        let visibleDepts = [];
+
+        if (CURRENT_USER.role === ROLES.MANAGER || CURRENT_USER.role === ROLES.EVALUATOR || CURRENT_USER.permissions?.view_all_depts) {
+            visibleDepts = allDepts;
+        } else {
+            const visibleIds = new Set(CURRENT_USER.permissions?.view_depts || []);
+            if (CURRENT_USER.departmentId) visibleIds.add(CURRENT_USER.departmentId);
+            visibleDepts = allDepts.filter(dept => visibleIds.has(dept.id));
+        }
+
+        visibleDepts.forEach(dept => {
+             html += `<li><span class="legend-swatch" style="background-color: ${dept.color || '#ccc'}"></span>${dept.name || 'ناشناخته'}</li>`; // Persian Text
+        });
+
+        html += '</ul>';
+        legendPopup.innerHTML = html;
+    }
+
+    // Renders the List view
+    function renderListView() {
+        calendarListContainer.innerHTML = '';
+        const events = (Array.isArray(appState.fullData.events) ? appState.fullData.events : [])
+            .filter(e => e.status === STATUS.APPROVED || e.status === STATUS.PENDING); // Filter relevant statuses
+        events.sort((a, b) => (new Date(a.startDateTime) - new Date(b.startDateTime))); // Sort by start time
+
+        if (events.length === 0) {
+            calendarListContainer.innerHTML = '<h2>نمای لیستی</h2><p>هیچ رویدادی برای نمایش در این هفته وجود ندارد.</p>'; // Persian Text
+            return;
+        }
+
+        let currentDayIndex = -1;
+        let html = '<h2>نمای لیستی</h2>'; // Persian Text
+        const dayFormatter = new Intl.DateTimeFormat('fa-IR', { weekday: 'long' });
+        const timeFormatter = new Intl.DateTimeFormat('fa-IR', { hour: '2-digit', minute: '2-digit', hour12: false });
+        const dateFormatter = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'short' }); // Shorter date format
+
+        events.forEach(event => {
+            try {
+                const startDT = new Date(event.startDateTime);
+                let endDT, endTimeStr;
+                const isEndTime24 = event.endDateTime.includes('T24:00');
+                if (isEndTime24) {
+                    endTimeStr = '۰۰:۰۰'; // Display as 00:00
+                    endDT = new Date(new Date(event.endDateTime).getTime() - 1000); // Use day before for display
+                } else {
+                    endDT = new Date(event.endDateTime);
+                    endTimeStr = timeFormatter.format(endDT);
+                }
+
+                const dayIndex = getDayIndexFromDateTime(event.startDateTime);
+
+                 if (dayIndex !== currentDayIndex) {
+                     currentDayIndex = dayIndex;
+                     // Add date for the day header
+                     const headerDate = new Date(appState.currentWeekStartDate);
+                     headerDate.setDate(headerDate.getDate() + dayIndex);
+                     html += `<h3>${WEEK_DAYS_PERSIAN[dayIndex]} <span class="list-view-header-date">(${toPersian(dateFormatter.format(headerDate))})</span></h3>`;
+                 }
+
+                 const startTimeStr = timeFormatter.format(startDT);
+                 const startDateStr = dateFormatter.format(startDT);
+                 const endDateStr = dateFormatter.format(endDT);
+
+                 const time = event.isAllDay
+                    ? `تمام روز (${toPersian(startDateStr)}${startDateStr !== endDateStr ? ' - ' + toPersian(endDateStr) : ''})` // Persian Text
+                    : `${toPersian(startTimeStr)} (${toPersian(startDateStr)}) - ${toPersian(endTimeStr)} (${toPersian(endDateStr)})`;
+
+                 const dept = (appState.fullData.departments || []).find(d => d.id === event.departmentId);
+                 const statusClass = `status-${event.status}`;
+                 let colorStyle = (event.status === STATUS.APPROVED && event.color) ? `style="border-right-color: ${event.color};"` : '';
+
+                 html += `
+                    <div class="list-view-item ${statusClass}" ${colorStyle}>
+                        <div class="list-view-time"> ${time} <div class="list-day">${dept ? dept.name : 'عمومی'}</div> </div>
+                        <div class="list-view-details"> <h4>${event.title} ${event.status === STATUS.PENDING ? '(در انتظار تایید)' : ''}</h4>
+                            <span>مجری: ${event.by || '-'}</span> <span>مخاطب: ${event.for || '-'}</span> </div>
+                        <div class="list-view-goal"> <h5>هدف:</h5> <p>${event.goal || '(ثبت نشده)'}</p> </div>
+                    </div>`;
+            } catch (e) { console.error("Error rendering list view item:", event.id, event.title, e); }
+        });
+        calendarListContainer.innerHTML = html;
+    }
+
+    // ===================================================================
+    // Event Modal Logic
+    // ===================================================================
+
+    // Opens the modal, pre-filling with event data if provided
+    function openEventModal(event = null, prefillDay = null, prefillTime = null) {
+        eventForm.reset();
+        approvalActions.style.display = 'none';
+        deleteEventBtn.style.display = 'none';
+        saveEventBtn.textContent = 'ذخیره'; // Persian Text
+        saveEventBtn.disabled = false; // Enable button
+        saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button text
+        managerColorInputs.style.display = 'none';
+        eventGoalGroup.style.display = (CURRENT_USER.role !== ROLES.PROPOSER && CURRENT_USER.role !== ROLES.VIEWER) ? 'block' : 'none'; // Show goal based on role
+        eventForm.querySelectorAll('input, select, textarea').forEach(el => el.disabled = false);
+
+        if (event) { // --- Edit/View Mode ---
+            eventIdInput.value = event.id;
+            eventTitleInput.value = event.title || '';
+            eventByInput.value = event.by || '';
+            eventForInput.value = event.for || '';
+            eventGoalInput.value = event.goal || '';
+            isAllDayCheckbox.checked = event.isAllDay || false;
+
+            try {
+                 const startDT = new Date(event.startDateTime);
+                 let endDT, endTimeStr;
+                 const isEndTime24 = event.endDateTime.includes('T24:00');
+                 if (isEndTime24) {
+                      endTimeStr = '24:00';
+                      endDT = new Date(new Date(event.endDateTime).getTime() - 1000); // Use day before for day index calculation
+                 } else {
+                     endDT = new Date(event.endDateTime);
+                     endTimeStr = endDT.toTimeString().substring(0, 5);
+                 }
+
+                 if (!isNaN(startDT)) {
+                    startDaySelect.value = getDayIndexFromDateTime(event.startDateTime);
+                    startTimeInput.value = startDT.toTimeString().substring(0, 5);
+                 } else throw new Error("Invalid start date");
+
+                 if (!isNaN(endDT)) {
+                     endDaySelect.value = getDayIndexFromDateTime(endDT.toISOString()); // Use ISOString to preserve timezone context if any
+                     endTimeInput.value = endTimeStr;
+                 } else throw new Error("Invalid end date");
+
+            } catch (e) {
+                 console.error("Error parsing event dates for modal:", event.id, event.title, e);
+                 showToast("خطا در خواندن تاریخ رویداد.", 'error'); // Persian Text
+                 // Fallback to current Tehran time
+                 const tehranNowParts = getTehranParts(new Date());
+                 startDaySelect.value = tehranNowParts.dayIndex; startTimeInput.value = "09:00";
+                 endDaySelect.value = tehranNowParts.dayIndex; endTimeInput.value = "10:00";
+            }
+
+            const canApprove = CURRENT_USER.role === ROLES.MANAGER || CURRENT_USER.role === ROLES.EVALUATOR;
+            const isOwner = event.proposerId === CURRENT_USER.id;
+            const status = event.status;
+
+             if (canApprove) {
+                 eventModalTitle.textContent = 'ویرایش / تایید رویداد'; // Persian Text
+                 if (status === STATUS.PENDING) approvalActions.style.display = 'flex';
+                 deleteEventBtn.style.display = 'block';
+                 if (CURRENT_USER.role === ROLES.MANAGER) managerColorInputs.style.display = 'block'; // Manager sees colors
+                 document.getElementById('eventBgColor').value = event.color || '#5c6bc0';
+                 document.getElementById('eventTextColor').value = event.textColor || '#ffffff';
+
+             } else if (isOwner && status !== STATUS.APPROVED) { // Owner can edit if not approved
+                 eventModalTitle.textContent = 'ویرایش پیشنهاد'; // Persian Text
+                 deleteEventBtn.style.display = 'block';
+             } else { // Viewer or viewing someone else's approved/pending event
+                 eventModalTitle.textContent = 'مشاهده رویداد'; // Persian Text
+                 eventForm.querySelectorAll('input, select, textarea').forEach(el => el.disabled = true);
+                 saveEventBtn.style.display = 'none';
+                 cancelEventBtn.textContent = 'بستن'; // Persian Text
+             }
+
+        } else { // --- Add New Mode ---
+            eventIdInput.value = '';
+            eventGoalInput.value = '';
+            isAllDayCheckbox.checked = false;
+
+            const tehranNowParts = getTehranParts(new Date()); // Use Tehran time for defaults
+            // Use prefill values if provided (from click-to-create)
+            startDaySelect.value = prefillDay !== null ? prefillDay : tehranNowParts.dayIndex;
+            startTimeInput.value = prefillTime !== null ? prefillTime : '09:00';
+            endDaySelect.value = prefillDay !== null ? prefillDay : tehranNowParts.dayIndex;
+            // Default end time: one hour after start, or 10:00 if no prefill
+            let defaultEndTime = '10:00';
+            if (prefillTime) {
+                try {
+                    const [h, m] = prefillTime.split(':').map(Number);
+                    if (!isNaN(h) && !isNaN(m)) {
+                         const nextHour = (h + 1) % 24;
+                         defaultEndTime = `${String(nextHour).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+                         if (defaultEndTime === '00:00') endTimeInput.value = '24:00'; // If wraps to midnight, suggest 24:00
+                         else endTimeInput.value = defaultEndTime;
+                    } else { endTimeInput.value = defaultEndTime;}
+                } catch { endTimeInput.value = defaultEndTime;}
+            } else { endTimeInput.value = defaultEndTime;}
+
+
+            if (CURRENT_USER.role === ROLES.MANAGER) {
+                eventModalTitle.textContent = 'افزودن رویداد جدید'; // Persian Text
+                managerColorInputs.style.display = 'block';
+                document.getElementById('eventBgColor').value = '#5c6bc0'; // Reset color picker
+                document.getElementById('eventTextColor').value = '#ffffff';
+            }
+            else if (CURRENT_USER.role === ROLES.EVALUATOR) eventModalTitle.textContent = 'افزودن رویداد (ارزیاب)'; // Persian Text
+            else eventModalTitle.textContent = 'پیشنهاد رویداد جدید'; // Persian Text
+        }
+
+        isAllDayCheckbox.dispatchEvent(new Event('change')); // Trigger time input disable/enable
+        cancelEventBtn.textContent = 'انصراف'; // Persian Text - Reset cancel button text
+        eventModal.style.display = 'flex';
+    }
+
+    function closeEventModal() { eventModal.style.display = 'none'; }
+
+    // Handles the event form submission (Save button)
+    async function handleEventFormSubmit(e) {
+        e.preventDefault();
+        saveEventBtn.disabled = true; // Prevent double-clicks
+        saveEventBtn.innerHTML = '<span class="button-spinner"></span> ذخیره...'; // Persian Text - Show loading
+
+         const startTimeValue = startTimeInput.value.trim();
+         const endTimeValue = endTimeInput.value.trim();
+         const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/; // HH:MM (00:00 - 23:59)
+         const endTime24Regex = /^24:00$/;
+
+         if (!isAllDayCheckbox.checked) {
+             if (!timeRegex.test(startTimeValue)) {
+                 showToast('فرمت ساعت شروع نامعتبر است (HH:MM).', 'error'); // Persian Text
+                 startTimeInput.focus();
+                 saveEventBtn.disabled = false; saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button
+                 return;
+             }
+             if (!timeRegex.test(endTimeValue) && !endTime24Regex.test(endTimeValue)) {
+                 showToast('فرمت ساعت پایان نامعتبر است (HH:MM یا 24:00).', 'error'); // Persian Text
+                 endTimeInput.focus();
+                 saveEventBtn.disabled = false; saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button
+                 return;
+             }
+         }
+
+         const startDateTime = combineDateTime(startDaySelect.value, isAllDayCheckbox.checked ? "00:00" : startTimeValue);
+         const endDateTime = combineDateTime(endDaySelect.value, isAllDayCheckbox.checked ? "24:00" : endTimeValue);
+
+         if (!startDateTime || !endDateTime) {
+              showToast("خطا در ساخت تاریخ/زمان. ورودی‌ها را بررسی کنید.", 'error'); // Persian Text
+              saveEventBtn.disabled = false; saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button
+              return;
+         }
+
+         // --- Time Validation (using Date objects for comparison) ---
+         try {
+             const startTestDT = new Date(startDateTime);
+             let endTestDT;
+             if (endDateTime.includes('T24:00:00')) {
+                 const datePart = endDateTime.substring(0, 10);
+                 const offsetPart = endDateTime.substring(19);
+                 const tempDate = new Date(`${datePart}T00:00:00${offsetPart}`);
+                 tempDate.setDate(tempDate.getDate() + 1);
+                 endTestDT = tempDate;
+             } else { endTestDT = new Date(endDateTime); }
+
+             if (isNaN(startTestDT) || isNaN(endTestDT) || endTestDT <= startTestDT) {
+                 showToast("تاریخ و ساعت پایان باید بعد از شروع باشد.", 'error'); // Persian Text
+                 saveEventBtn.disabled = false; saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button
+                 return;
+             }
+         } catch (validationError) {
+             console.error("Date validation error:", validationError);
+             showToast("خطا در اعتبارسنجی تاریخ.", 'error'); // Persian Text
+             saveEventBtn.disabled = false; saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button
+             return;
+         }
+         // --- End Time Validation ---
+
+        const eventData = {
+            id: eventIdInput.value || null, title: eventTitleInput.value.trim(), by: eventByInput.value.trim(),
+            for: eventForInput.value.trim(), goal: eventGoalInput.value.trim(), isAllDay: isAllDayCheckbox.checked,
+            startDateTime: startDateTime, endDateTime: endDateTime,
+            // Include colors only if manager is adding/editing
+            ...( (CURRENT_USER.role === ROLES.MANAGER && managerColorInputs.style.display === 'block') && {
+                color: document.getElementById('eventBgColor').value,
+                textColor: document.getElementById('eventTextColor').value
+            })
+        };
+
+        const result = await apiCall('saveEvent', { event: eventData });
+        saveEventBtn.disabled = false; saveEventBtn.innerHTML = 'ذخیره'; // Persian Text - Reset button always
+
+        if (result) {
+            showToast(result.message || 'رویداد ذخیره شد.', 'success'); // Persian Text
+            closeEventModal();
+            fetchAndRenderCurrentWeekData(); // Fetch new data and re-render
+        }
+        // apiCall handles showing error toasts on failure
+    }
+
+    // Handles Approve/Reject button clicks
+    async function handleEventStatusUpdate(newStatus) {
+        const eventId = eventIdInput.value;
+        if (!eventId) return;
+        const button = (newStatus === STATUS.APPROVED) ? approveEventBtn : rejectEventBtn;
+        button.disabled = true;
+        button.innerHTML = '<span class="button-spinner"></span>'; // Show spinner
+
+        const result = await apiCall('updateEventStatus', { id: eventId, status: newStatus });
+
+        button.disabled = false;
+        button.innerHTML = (newStatus === STATUS.APPROVED) ? 'تایید' : 'رد کردن'; // Persian Text
+
+        if (result) {
+            showToast(result.message || 'وضعیت به‌روز شد.', 'success'); // Persian Text
+            closeEventModal();
+            fetchAndRenderCurrentWeekData();
+        }
+    }
+
+    // Handles Delete button click
+    async function handleEventDelete() {
+        const eventId = eventIdInput.value;
+        if (!eventId) return;
+
+        // Use a custom confirmation dialog eventually, for now confirm is okay
+        if (!confirm('آیا از حذف این رویداد مطمئن هستید؟')) return; // Persian Text
+
+        deleteEventBtn.disabled = true;
+        deleteEventBtn.innerHTML = '<span class="button-spinner"></span>';
+
+        const result = await apiCall('deleteEvent', { id: eventId });
+
+        deleteEventBtn.disabled = false;
+        deleteEventBtn.innerHTML = 'حذف'; // Persian Text
+
+        if (result) {
+            showToast(result.message || 'رویداد حذف شد.', 'success'); // Persian Text
+            closeEventModal();
+            fetchAndRenderCurrentWeekData();
+        }
+    }
+
+    // ===================================================================
+    // Settings Modal Logic
+    // ===================================================================
+
+    // Generates week options for the settings dropdown
+    function generateWeeks() {
+        if (!weekSelector) return;
+        weekSelector.innerHTML = '';
+        let currentSat = getStartDate(formatDate(appState.currentWeekStartDate)); // Start from current week's Saturday
+        currentSat.setDate(currentSat.getDate() - (4 * 7)); // Go back 4 weeks
+
+        const formatter = new Intl.DateTimeFormat('fa-IR', { day: 'numeric', month: 'long', year: 'numeric' });
+
+        for (let i = 0; i < 12; i++) { // Show 4 weeks before, current, 7 weeks after
+            const satStr = formatDate(currentSat);
+            const endOfWeek = new Date(currentSat); endOfWeek.setDate(currentSat.getDate() + 6);
+            const option = document.createElement('option');
+            option.value = satStr;
+            option.textContent = `( ${toPersian(formatter.format(currentSat))} - ${toPersian(formatter.format(endOfWeek))} )`;
+            if (satStr === formatDate(appState.currentWeekStartDate)) option.selected = true; // Select the actual current week
+            weekSelector.appendChild(option);
+            currentSat.setDate(currentSat.getDate() + 7); // Move to next Saturday
+        }
+    }
+
+    // Opens the settings modal
+    function openSettingsModal() {
+        if (!settingsModal) return;
+        mainHeaderInput.value = appState.fullData.settings?.headerText || '';
+        generateWeeks(); // Populate week selector based on current view
+        settingsModal.style.display = 'flex';
+    }
+
+    // Saves settings changes
+    async function handleSettingsSave() {
+        const saveBtn = document.getElementById('save-settings-btn');
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = '<span class="button-spinner"></span> ذخیره...'; // Persian Text
+
+        const newSettings = { headerText: mainHeaderInput.value, weekStartDate: weekSelector.value };
+        const result = await apiCall('saveSettings', newSettings);
+
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = 'ذخیره تنظیمات'; // Persian Text
+
+        if (result) {
+             showToast(result.message || 'تنظیمات ذخیره شد.', 'success'); // Persian Text
+             settingsModal.style.display = 'none';
+             // Update state and UI immediately
+             appState.fullData.settings.headerText = newSettings.headerText;
+             appState.fullData.settings.weekStartDate = newSettings.weekStartDate; // This is the *default* start week
+             document.title = newSettings.headerText;
+             // Navigate to the newly selected default week
+             appState.currentWeekStartDate = getStartDate(newSettings.weekStartDate);
+             fetchAndRenderCurrentWeekData(); // Fetch and render the new week
+         }
+     }
+
+    // ===================================================================
+    // Departments Modal Logic
+    // ===================================================================
+     function renderDeptsEditor() { /* ... (Content mostly unchanged, needs translation) ... */
+        if (!deptsListEditor) return;
+        deptsListEditor.innerHTML = ''; // Clear previous items
+        (appState.fullData.departments || []).forEach(dept => {
+            deptsListEditor.appendChild(createDeptEditorRow(dept));
+        });
+     }
+     function createDeptEditorRow(dept = null) { /* ... (Content mostly unchanged, needs translation) ... */
+        const row = document.createElement('div');
+        row.className = 'dept-item';
+        const id = dept ? (dept.id || '') : ('new_' + Date.now());
+        row.dataset.id = id;
+
+        row.innerHTML = `
+            <input type="text" class="dept-name" placeholder="نام دپارتمان" value="${dept ? (dept.name || '') : ''}">
+            <input type="color" class="dept-color" value="${dept ? (dept.color || '#cccccc') : '#cccccc'}">
+            <button type="button" class="dept-remove danger-btn small-btn">حذف</button>
+        `;
+        row.querySelector('.dept-remove').addEventListener('click', () => {
+            if (confirm(`آیا از حذف دپارتمان "${row.querySelector('.dept-name').value || 'جدید'}" مطمئن هستید؟`)) { // Persian Text
+                row.remove();
+            }
+        });
+        return row;
+     }
+     function openDeptsModal() { /* ... (Content mostly unchanged, needs translation) ... */
+        if (!deptsModal) return;
+        renderDeptsEditor();
+        deptsModal.style.display = 'flex';
+     }
+     function addNewDeptEditorRow() { /* ... (Content mostly unchanged, needs translation) ... */
+         if (!deptsListEditor) return;
+         deptsListEditor.appendChild(createDeptEditorRow());
+     }
+     async function handleDeptsSave() { /* ... (Content mostly unchanged, needs translation) ... */
+        const saveBtn = document.getElementById('save-depts-btn');
+        saveBtn.disabled = true; saveBtn.innerHTML = '<span class="button-spinner"></span> ذخیره...'; // Persian Text
+
+        const rows = deptsListEditor.querySelectorAll('.dept-item');
+        const departments = [];
+        let valid = true;
+        rows.forEach(row => {
+            const name = row.querySelector('.dept-name').value.trim();
+            const color = row.querySelector('.dept-color').value;
+            if (name && color) {
+                departments.push({ id: row.dataset.id.startsWith('new_') ? null : row.dataset.id, name: name, color: color });
+            } else if (name || color) { valid = false; } // Invalid if only one is filled
+        });
+
+        if (!valid) {
+            showToast('لطفاً نام و رنگ را برای همه دپارتمان‌ها مشخص کنید.', 'error'); // Persian Text
+            saveBtn.disabled = false; saveBtn.innerHTML = 'ذخیره دپارتمان‌ها'; // Persian Text
+            return;
+        }
+
+        const result = await apiCall('manageDepartments', { departments: departments });
+        saveBtn.disabled = false; saveBtn.innerHTML = 'ذخیره دپارتمان‌ها'; // Persian Text
+
+        if (result) {
+            showToast(result.message || 'دپارتمان‌ها ذخیره شدند.', 'success'); // Persian Text
+            deptsModal.style.display = 'none';
+            // Need to refetch data as department IDs might affect rendering/permissions
+            fetchAndRenderCurrentWeekData();
+        }
+     }
+
+    // ===================================================================
+    // Users Modal Logic
+    // ===================================================================
+     function renderUsersEditor() { /* ... (Content mostly unchanged, needs translation) ... */
+         if (!usersListEditor) return;
+         usersListEditor.innerHTML = ''; // Clear previous
+         (appState.fullData.users || []).forEach(user => {
+             usersListEditor.appendChild(createUserEditorRow(user));
+         });
+     }
+     function createUserEditorRow(user = null) { /* ... (Content mostly unchanged, needs translation) ... */
+        const isNew = user === null;
+        const u = user || { id: null, username: '', displayName: '', role: ROLES.VIEWER, departmentId: null, permissions: { view_all_depts: false, view_depts: [], view_all_users: false, view_users: [] } };
+        const row = document.createElement('div'); // Use div as container, not form
+        row.className = 'user-item';
+        row.dataset.id = u.id || 'new_' + Date.now();
+
+        // Department Options
+        let deptOptions = '<option value="">(هیچکدام)</option>'; // Persian Text
+        (appState.fullData.departments || []).forEach(d => { deptOptions += `<option value="${d.id}" ${u.departmentId === d.id ? 'selected' : ''}>${d.name}</option>`; });
+
+        // Role Options
+        const roles = { [ROLES.MANAGER]: 'مدیر', [ROLES.EVALUATOR]: 'ارزیاب', [ROLES.PROPOSER]: 'پیشنهاد دهنده', [ROLES.VIEWER]: 'بیننده' }; // Persian Text
+        let roleOptions = '';
+        Object.entries(roles).forEach(([value, text]) => { roleOptions += `<option value="${value}" ${u.role === value ? 'selected' : ''}>${text}</option>`; });
+
+        // Permission Checkboxes
+        let deptPerms = ''; (appState.fullData.departments || []).forEach(d => { deptPerms += `<label><input type="checkbox" class="perm-view-dept" value="${d.id}" ${u.permissions.view_depts?.includes(d.id) ? 'checked' : ''}> ${d.name}</label>`; });
+        let userPerms = ''; (appState.fullData.users || []).filter(usr => usr.id !== u.id).forEach(usr => { userPerms += `<label><input type="checkbox" class="perm-view-user" value="${usr.id}" ${u.permissions.view_users?.includes(usr.id) ? 'checked' : ''}> ${usr.displayName}</label>`; });
+
+        row.innerHTML = `
+            <div class="form-group"> <label>نام کاربری</label> <input type="text" class="user-username" value="${u.username}"> </div>
+            <div class="form-group"> <label>نام نمایشی</label> <input type="text" class="user-displayName" value="${u.displayName}"> </div>
+            <div class="form-group"> <label>رمز عبور</label> <input type="password" class="user-password" placeholder="${isNew ? 'الزامی' : '(خالی=بدون تغییر)'}"> </div>
+            <div class="form-group"> <label>نقش</label> <select class="user-role">${roleOptions}</select> </div>
+            <div class="form-group"> <label>دپارتمان اصلی</label> <select class="user-departmentId">${deptOptions}</select> </div>
+
+            <div class="user-item-permissions">
+                 <div class="permission-group">
+                    <h5>دسترسی دپارتمان‌ها</h5>
+                    <label><input type="checkbox" class="perm-view-all-depts" ${u.permissions.view_all_depts ? 'checked' : ''}> <b>مشاهده همه دپارتمان‌ها</b></label>
+                    <div class="permission-group-items">${deptPerms || '(دپارتمانی وجود ندارد)'}</div>
+                 </div>
+                 <div class="permission-group">
+                    <h5>دسترسی کاربران (رویدادهای تایید شده)</h5>
+                    <label><input type="checkbox" class="perm-view-all-users" ${u.permissions.view_all_users ? 'checked' : ''}> <b>مشاهده همه کاربران</b></label>
+                    <div class="permission-group-items">${userPerms || '(کاربر دیگری وجود ندارد)'}</div>
+                 </div>
+            </div>
+
+            <div class="user-item-actions">
+                <button type="button" class="user-save primary-btn small-btn">ذخیره</button>
+                ${!isNew ? `<button type="button" class="user-delete danger-btn small-btn">حذف</button>` : ''}
+            </div>
+        `;
+        row.querySelector('.user-save').addEventListener('click', (e) => handleUserSave(row, e.target));
+        if (!isNew) { row.querySelector('.user-delete').addEventListener('click', (e) => handleUserDelete(u.id, e.target)); }
+        return row;
+     }
+     function openUsersModal() { /* ... (Content mostly unchanged, needs translation) ... */
+        if (!usersModal) return;
+        renderUsersEditor();
+        usersModal.style.display = 'flex';
+     }
+     function addNewUserEditorRow() { /* ... (Content mostly unchanged, needs translation) ... */
+         if (!usersListEditor) return;
+         usersListEditor.prepend(createUserEditorRow(null)); // Add to top
+     }
+     async function handleUserSave(rowEl, buttonEl) { /* ... (Content mostly unchanged, needs translation) ... */
+         buttonEl.disabled = true; buttonEl.innerHTML = '<span class="button-spinner"></span>';
+
+         const id = rowEl.dataset.id.startsWith('new_') ? null : rowEl.dataset.id;
+         const user = {
+            id: id, username: rowEl.querySelector('.user-username').value.trim(), displayName: rowEl.querySelector('.user-displayName').value.trim(),
+            password: rowEl.querySelector('.user-password').value || null, // Send null if empty
+            role: rowEl.querySelector('.user-role').value, departmentId: rowEl.querySelector('.user-departmentId').value || null,
+            permissions: {
+                view_all_depts: rowEl.querySelector('.perm-view-all-depts').checked, view_depts: Array.from(rowEl.querySelectorAll('.perm-view-dept:checked')).map(el => el.value),
+                view_all_users: rowEl.querySelector('.perm-view-all-users').checked, view_users: Array.from(rowEl.querySelectorAll('.perm-view-user:checked')).map(el => el.value)
+            }
+         };
+        if (!user.username || !user.displayName) { showToast('نام کاربری و نام نمایشی الزامی است.', 'error'); buttonEl.disabled = false; buttonEl.innerHTML = 'ذخیره'; return; } // Persian Text
+        if (!id && !user.password) { showToast('رمز عبور برای کاربر جدید الزامی است.', 'error'); buttonEl.disabled = false; buttonEl.innerHTML = 'ذخیره'; return; } // Persian Text
+
+        const result = await apiCall('manageUsers', { sub_action: 'save', user: user });
+        buttonEl.disabled = false; buttonEl.innerHTML = 'ذخیره'; // Persian Text
+
+        if (result) {
+            showToast(result.message || 'کاربر ذخیره شد.', 'success'); // Persian Text
+            appState.fullData.users = result.data || []; // Update local user list
+            renderUsersEditor(); // Re-render the list
+            if (user.id === CURRENT_USER.id) { showToast('اطلاعات شما تغییر کرد. صفحه مجدداً بارگذاری می‌شود.', 'info', 4000); setTimeout(() => window.location.reload(), 4000); } // Persian Text
+        }
+     }
+     async function handleUserDelete(userId, buttonEl) { /* ... (Content mostly unchanged, needs translation) ... */
+        if (userId === CURRENT_USER.id) { showToast('شما نمی‌توانید حساب کاربری خود را حذف کنید.', 'warning'); return; } // Persian Text
+        if (!confirm('آیا از حذف این کاربر مطمئن هستید؟ این عمل قابل بازگشت نیست.')) return; // Persian Text
+        buttonEl.disabled = true; buttonEl.innerHTML = '<span class="button-spinner"></span>';
+
+        const result = await apiCall('manageUsers', { sub_action: 'delete', user: { id: userId } });
+        // No need to re-enable button as the row will be removed on success
+
+        if (result) {
+            showToast(result.message || 'کاربر حذف شد.', 'success'); // Persian Text
+            appState.fullData.users = result.data || []; // Update local user list
+            renderUsersEditor(); // Re-render the list
+        } else {
+             buttonEl.disabled = false; buttonEl.innerHTML = 'حذف'; // Persian Text - Re-enable on error
+        }
+     }
+
+    // ===================================================================
+    // Issue Reporting Modals Logic
+    // ===================================================================
+    async function handleIssueSend() { /* ... (Content mostly unchanged, needs translation) ... */
+        const text = issueTextInput.value.trim();
+        if (!text) { showToast('متن پیام نمی‌تواند خالی باشد.', 'warning'); return; } // Persian Text
+        const button = document.getElementById('send-issue-btn');
+        button.disabled = true; button.innerHTML = '<span class="button-spinner"></span> ارسال...'; // Persian Text
+
+        const result = await apiCall('reportIssue', { text: text });
+        button.disabled = false; button.innerHTML = 'ارسال پیام'; // Persian Text
+
+        if (result) {
+            showToast(result.message || 'پیام شما ثبت شد.', 'success'); // Persian Text
+            issueTextInput.value = '';
+            issueModal.style.display = 'none';
+        }
+    }
+    async function openViewIssuesModal() { /* ... (Content mostly unchanged, needs translation) ... */
+        showLoader(); // Show loader manually as it's a GET request
+        const result = await apiCall('getIssues', null, 'GET');
+        hideLoader(); // Hide loader manually
+
+        if (result && result.data) {
+            issuesListContainer.innerHTML = ''; // Clear previous
+            if (result.data.length === 0) {
+                issuesListContainer.innerHTML = '<p>هیچ پیامی ثبت نشده است.</p>'; // Persian Text
+            } else {
+                result.data.forEach(issue => {
+                     const issueDiv = document.createElement('div'); issueDiv.className = 'issue-item';
+                     const timestamp = new Date(issue.timestamp).toLocaleString('fa-IR', { dateStyle: 'short', timeStyle: 'short' });
+                     issueDiv.innerHTML = `
+                        <p>${issue.text.replace(/\n/g, '<br>')}</p>
+                        <div class="issue-meta"> <span>توسط: ${issue.userName || 'ناشناس'}</span> | <span>${toPersian(timestamp)}</span> </div>
+                     `;
+                     issuesListContainer.appendChild(issueDiv);
+                });
+            }
+            viewIssuesModal.style.display = 'flex';
+        }
+    }
+
+    // ===================================================================
+    // FAB Menu Logic
+    // ===================================================================
+     function setupFabMenu() {
+        if (!fabMenu || !fabMainBtn ) return;
+        fabMenu.innerHTML = ''; // Clear previous buttons
+        const role = CURRENT_USER.role;
+        let actions = [];
+
+        // Define possible actions with Persian titles
+        const addAction = eventModal ? { id: 'fab-add', class: 'action-add', title: 'افزودن/پیشنهاد رویداد', icon: '+', modal: eventModal, fn: () => openEventModal(null) } : null; // Persian Text
+        const deptsAction = deptsModal && role === ROLES.MANAGER ? { id: 'fab-depts', class: 'action-admin', title: 'مدیریت دپارتمان‌ها', icon: '🏛️', fn: openDeptsModal } : null; // Persian Text
+        const usersAction = usersModal && role === ROLES.MANAGER ? { id: 'fab-users', class: 'action-admin', title: 'مدیریت کاربران', icon: '👥', fn: openUsersModal } : null; // Persian Text
+        const viewIssuesAction = viewIssuesModal && role === ROLES.MANAGER ? { id: 'fab-view-issues', class: 'action-view-issue', title: 'مشاهده پیام‌ها', icon: '✉️', fn: openViewIssuesModal } : null; // Persian Text
+        const reportIssueAction = issueModal ? { id: 'fab-report-issue', class: 'action-issue', title: 'گزارش مشکل / بازخورد', icon: '⚠️', modal: issueModal, fn: () => issueModal.style.display = 'flex' } : null; // Persian Text
+        const settingsAction = settingsModal && role === ROLES.MANAGER ? { id: 'fab-settings', class: 'action-admin', title: 'تنظیمات تقویم', icon: '⚙️', fn: openSettingsModal } : null; // Persian Text
+
+        // Add actions based on role
+        if (role === ROLES.MANAGER) actions = [addAction, deptsAction, usersAction, settingsAction, viewIssuesAction, reportIssueAction].filter(Boolean);
+        else if (role === ROLES.EVALUATOR) actions = [addAction, reportIssueAction].filter(Boolean);
+        else if (role === ROLES.PROPOSER) actions = [addAction, reportIssueAction].filter(Boolean);
+        else actions = [reportIssueAction].filter(Boolean); // Viewer
+
+        // Create buttons
+        actions.forEach(action => {
+            const btn = document.createElement('button'); btn.id = action.id; btn.className = `fab fab-action ${action.class}`; btn.title = action.title; btn.innerHTML = `<span>${action.icon}</span>`;
+            btn.addEventListener('click', (e) => {
+                 e.stopPropagation();
+                 if (action.fn) action.fn(); // Use the defined function
+                 fabMainBtn.classList.remove('active'); fabMenu.classList.remove('active'); // Close menu
+            });
+            fabMenu.appendChild(btn);
+        });
+     }
+
+    // ===================================================================
+    // Current Time Indicator Logic
+    // ===================================================================
+    function createOrUpdateTimeIndicator() {
+        document.querySelectorAll('.time-indicator').forEach(el => el.remove()); // Remove previous indicators
+
+        let now;
+        try { // Estimate current server time
+             if (!appState.initialServerTime) return; // Wait for initial load
+             const elapsed = new Date().getTime() - appState.initialClientTime.getTime();
+             now = new Date(appState.initialServerTime.getTime() + elapsed);
+             if (isNaN(now)) throw new Error("Invalid date calculation");
+        } catch(e) { console.error("Error estimating current server time for indicator:", e); return; }
+
+        const tehranParts = getTehranParts(now);
+        const todayIndex = tehranParts.dayIndex;
+
+        const weekStartMS = appState.currentWeekStartDate.getTime();
+        const weekEndMS = weekStartMS + 7 * MS_PER_DAY;
+
+        // Only show indicator if 'now' is within the current week view
+        if (now.getTime() >= weekStartMS && now.getTime() < weekEndMS) {
+            const minutesIntoDay = tehranParts.hour * 60 + tehranParts.minute;
+            const percentageOfDay = (minutesIntoDay / (24 * 60)) * 100;
+
+            const isMobile = document.body.classList.contains('mobile-view');
+            const targetCell = document.querySelector(`.day-${isMobile ? 'column' : 'row'}[data-day-index="${todayIndex}"] .timeline-cell`);
+
+            if (targetCell) {
+                 const indicator = document.createElement('div');
+                 indicator.className = `time-indicator ${isMobile ? 'mobile' : 'desktop'}`;
+                 if (isMobile) {
+                     indicator.style.top = `${percentageOfDay}%`;
+                     // Mobile indicator is now inside the cell, no need for left/width calc here
+                 } else {
+                     indicator.style.right = `${percentageOfDay}%`; // Desktop uses right
+                 }
+                 targetCell.appendChild(indicator);
+            }
+        }
+    }
+
+    // Interval function to update the indicator's position
+    function updateTimeIndicator() {
+         // Re-create the indicator entirely to handle day changes and position updates
+         createOrUpdateTimeIndicator();
+    }
+
+    // Starts the interval timer for the time indicator
+    function startTimeIndicator() {
+        if (appState.timeIndicatorInterval) clearInterval(appState.timeIndicatorInterval);
+        createOrUpdateTimeIndicator(); // Initial creation
+        appState.timeIndicatorInterval = setInterval(updateTimeIndicator, 60000); // Update every minute
+    }
+
+    // ===================================================================
+    // Mini Calendar Logic (New)
+    // ===================================================================
+    function renderMiniCalendar(year, month) {
+        if (!miniCalendarPopup || !miniCalendarHeader || !miniCalendarDays) return;
+
+        const date = new Date(year, month, 1);
+        appState.miniCalendar.currentMonth = date; // Update state
+
+        const monthFormatter = new Intl.DateTimeFormat('fa-IR', { month: 'long', year: 'numeric' });
+        miniCalendarHeader.textContent = toPersian(monthFormatter.format(date));
+
+        miniCalendarDays.innerHTML = ''; // Clear previous days
+
+        // Add weekday headers (Persian)
+        ['ش', 'ی', 'د', 'س', 'چ', 'پ', 'ج'].forEach(day => {
+            const weekdayDiv = document.createElement('div');
+            weekdayDiv.className = 'mini-calendar-weekday';
+            weekdayDiv.textContent = day;
+            miniCalendarDays.appendChild(weekdayDiv);
+        });
+
+        // Calculate offset for the first day of the month (Saturday = 0)
+        const firstDayOfMonth = date.getDay(); // 0=Sun, 6=Sat
+        const offset = (firstDayOfMonth + 1) % 7; // Convert to Sat=0
+
+        // Add empty cells for offset
+        for (let i = 0; i < offset; i++) {
+            miniCalendarDays.appendChild(document.createElement('div'));
+        }
+
+        // Add day buttons
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        const today = new Date(); today.setHours(0,0,0,0); // Today without time
+        const currentWeekStart = new Date(appState.currentWeekStartDate);
+        const currentWeekEnd = new Date(currentWeekStart); currentWeekEnd.setDate(currentWeekStart.getDate() + 6);
+
+        for (let day = 1; day <= daysInMonth; day++) {
+            const dayBtn = document.createElement('button');
+            dayBtn.className = 'mini-calendar-day';
+            dayBtn.textContent = toPersian(day);
+            dayBtn.dataset.date = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+            const thisDate = new Date(year, month, day);
+            if (thisDate.getTime() === today.getTime()) dayBtn.classList.add('today');
+            if (thisDate >= currentWeekStart && thisDate <= currentWeekEnd) dayBtn.classList.add('selected-week'); // Highlight current week
+
+            dayBtn.addEventListener('click', () => {
+                const selectedDateStr = dayBtn.dataset.date;
+                appState.currentWeekStartDate = getStartDate(selectedDateStr); // Go to the week of the selected date
+                miniCalendarPopup.classList.remove('visible'); // Close picker
+                appState.miniCalendar.pickerOpen = false;
+                fetchAndRenderCurrentWeekData(); // Fetch and render new week
+            });
+            miniCalendarDays.appendChild(dayBtn);
+        }
+    }
+
+    function navigateMiniCalendar(direction) {
+        appState.miniCalendar.currentMonth.setMonth(appState.miniCalendar.currentMonth.getMonth() + direction);
+        renderMiniCalendar(appState.miniCalendar.currentMonth.getFullYear(), appState.miniCalendar.currentMonth.getMonth());
+    }
+
+    // ===================================================================
+    // Mobile Gesture Handlers
+    // ===================================================================
+    function handleGestureStart(e) {
+        const isMobile = document.body.classList.contains('mobile-view');
+        if (!isMobile) return;
+        if (e.target.closest('.event, .event-allday, button, a, select')) return; // Ignore gestures on interactive elements
+
+        const touches = e.touches;
+        if (touches.length === 2) { // Pinch Start
+            e.preventDefault(); // Prevent default pinch zoom/scroll
+            appState.gestureState.active = true;
+            appState.gestureState.isSwipe = false;
+            const dx = touches[0].clientX - touches[1].clientX;
+            const dy = touches[0].clientY - touches[1].clientY;
+            // Determine dominant axis
+            if (Math.abs(dx) > Math.abs(dy) * 1.5) { appState.gestureState.type = 'horizontal'; appState.gestureState.lastDist = Math.abs(dx); }
+            else if (Math.abs(dy) > Math.abs(dx) * 1.5) { appState.gestureState.type = 'vertical'; appState.gestureState.lastDist = Math.abs(dy); }
+            else { appState.gestureState.type = null; } // Dead zone
+        } else if (touches.length === 1) { // Swipe Start
+            appState.gestureState.isSwipe = true;
+            appState.gestureState.swipeStartX = touches[0].clientX;
+            appState.gestureState.swipeStartY = touches[0].clientY;
+        }
+    }
+
+    function handleGestureMove(e) {
+        if (!appState.gestureState.active || !appState.gestureState.type || e.touches.length !== 2) return;
+        e.preventDefault(); // Prevent scroll only when pinch is active
+
+        const touches = e.touches;
+        const config = appState.mobileViewConfig; // Shortcut
+        const state = appState.gestureState; // Shortcut
+        const threshold = 20; // Min distance change to trigger zoom
+
+        if (state.type === 'horizontal') { // Zoom Days
+            const dist = Math.abs(touches[0].clientX - touches[1].clientX);
+            const delta = dist - state.lastDist;
+            if (Math.abs(delta) > threshold) {
+                if (delta > 0) { // Zoom In (less days)
+                    if (config.dayCount === 7) config.dayCount = 4;
+                    else if (config.dayCount === 4) config.dayCount = 3;
+                    else if (config.dayCount === 3) config.dayCount = 2;
+                    else if (config.dayCount === 2) config.dayCount = 1;
+                } else { // Zoom Out (more days)
+                    if (config.dayCount === 1) config.dayCount = 2;
+                    else if (config.dayCount === 2) config.dayCount = 3;
+                    else if (config.dayCount === 3) config.dayCount = 4;
+                    else if (config.dayCount === 4) config.dayCount = 7;
+                }
+                state.lastDist = dist;
+                updateMobileViewCSS();
+            }
+        } else if (state.type === 'vertical') { // Zoom Hours
+            const dist = Math.abs(touches[0].clientY - touches[1].clientY);
+            const delta = dist - state.lastDist;
+            if (Math.abs(delta) > threshold) {
+                if (delta > 0) { // Zoom In (bigger hours)
+                    if (config.hourZoom === 1) config.hourZoom = 2;
+                    else if (config.hourZoom === 2) config.hourZoom = 3;
+                    else if (config.hourZoom === 3) config.hourZoom = 4;
+                } else { // Zoom Out (smaller hours)
+                    if (config.hourZoom === 4) config.hourZoom = 3;
+                    else if (config.hourZoom === 3) config.hourZoom = 2;
+                    else if (config.hourZoom === 2) config.hourZoom = 1;
+                }
+                state.lastDist = dist;
+                updateMobileViewCSS();
+            }
+        }
+    }
+
+    function handleGestureEnd(e) {
+         if (appState.gestureState.active) {
+            appState.gestureState.active = false; appState.gestureState.type = null; appState.gestureState.lastDist = 0;
+         }
+         if (appState.gestureState.isSwipe && e.changedTouches.length === 1) {
+             const touch = e.changedTouches[0];
+             const dx = touch.clientX - appState.gestureState.swipeStartX;
+             const dy = touch.clientY - appState.gestureState.swipeStartY;
+             // Trigger swipe only if horizontal movement is dominant
+             if (Math.abs(dx) > appState.gestureState.swipeMinDist && Math.abs(dy) < (appState.gestureState.swipeMinDist / 1.5)) {
+                 handleMobileSwipe(dx > 0 ? 'right' : 'left');
+             }
+             appState.gestureState.isSwipe = false;
+         }
+    }
+
+    // Handles week navigation via swipe on mobile
+    function handleMobileSwipe(direction) {
+        const container = document.querySelector('.mobile-days-container');
+        if (!container) return;
+        const scrollLeft = container.scrollLeft; const scrollWidth = container.scrollWidth; const clientWidth = container.clientWidth;
+        const threshold = 10; // Scroll threshold
+        if (direction === 'right' && scrollLeft <= threshold) navigateWeek(-7); // Swipe right at start -> Prev week
+        else if (direction === 'left' && (scrollLeft + clientWidth) >= (scrollWidth - threshold)) navigateWeek(7); // Swipe left at end -> Next week
+    }
+
+    // ===================================================================
+    // Utility & Event Listeners Setup
+    // ===================================================================
+
+    // Calculate actual mobile header height and update CSS variable
+    function calculateMobileHeaderHeight() {
+        if (window.matchMedia("(max-width: 768px)").matches && mainHeader) {
+            const height = mainHeader.offsetHeight;
+            document.documentElement.style.setProperty('--mobile-header-height', `${height}px`);
+        } else {
+             document.documentElement.style.setProperty('--mobile-header-height', `${61}px`); // Reset to default if not mobile
+        }
+    }
+
+    function setupEventListeners() {
+        // --- Grid Click (Events & Click-to-Create) ---
+        calendarGridContainer.addEventListener('click', (e) => {
+            const eventDiv = e.target.closest('.event, .event-allday');
+            const timeSlot = e.target.closest('.timeline-cell .time-slot');
+            const allDayCell = e.target.closest('.all-day-cell');
+
+            if (eventDiv) { // --- Clicked on an existing event ---
+                const isLocked = eventDiv.dataset.locked === 'true';
+                if (isLocked) { showToast('شما اجازه ویرایش این رویداد را ندارید.', 'warning'); return; } // Persian Text
+                const event = JSON.parse(eventDiv.dataset.event);
+                if (event.isHoliday) return; // Don't open modal for holidays
+                openEventModal(event);
+            } else if (timeSlot) { // --- Clicked on an empty timeline slot ---
+                 if (CURRENT_USER.role === ROLES.VIEWER) return; // Viewers can't create
+                 const dayIndex = parseInt(timeSlot.closest('.timeline-cell').dataset.dayIndex, 10);
+                 const slotIndex = parseInt(timeSlot.dataset.slot, 10);
+                 const hour = Math.floor(slotIndex / 2);
+                 const minute = (slotIndex % 2) * 30;
+                 const timeStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+                 openEventModal(null, dayIndex, timeStr); // Prefill modal
+            } else if (allDayCell) { // --- Clicked on an empty all-day slot ---
+                 if (CURRENT_USER.role === ROLES.VIEWER) return;
+                 const dayIndex = parseInt(allDayCell.dataset.dayIndex, 10);
+                 openEventModal(null, dayIndex, null); // Prefill day, null time (modal will set all-day defaults)
+                 // Manually check the all-day box after modal opens
+                 setTimeout(() => { if (isAllDayCheckbox) isAllDayCheckbox.checked = true; isAllDayCheckbox.dispatchEvent(new Event('change')); }, 50);
+            }
+        });
+
+        // --- Header Buttons ---
+        if (calendarTitle) calendarTitle.addEventListener('click', () => {
+            if (appState.miniCalendar.pickerOpen) {
+                 miniCalendarPopup.classList.remove('visible');
+            } else {
+                 const current = appState.currentWeekStartDate;
+                 renderMiniCalendar(current.getFullYear(), current.getMonth());
+                 miniCalendarPopup.classList.add('visible');
+            }
+            appState.miniCalendar.pickerOpen = !appState.miniCalendar.pickerOpen;
+        });
+        if (prevWeekBtn) prevWeekBtn.addEventListener('click', () => navigateWeek(-7));
+        if (nextWeekBtn) nextWeekBtn.addEventListener('click', () => navigateWeek(7));
+        if (todayBtn) todayBtn.addEventListener('click', () => {
+            const todayStartDate = getStartDate(); // Get today's week start
+            if (todayStartDate.getTime() !== appState.currentWeekStartDate.getTime()) {
+                appState.currentWeekStartDate = todayStartDate;
+                fetchAndRenderCurrentWeekData();
+            }
+             // Close mini calendar if open
+            if (appState.miniCalendar.pickerOpen) {
+                miniCalendarPopup.classList.remove('visible');
+                appState.miniCalendar.pickerOpen = false;
+            }
+        });
+
+        // Mini Calendar Navigation
+        if (miniCalPrevBtn) miniCalPrevBtn.addEventListener('click', () => navigateMiniCalendar(-1));
+        if (miniCalNextBtn) miniCalNextBtn.addEventListener('click', () => navigateMiniCalendar(1));
+
+        // Close mini calendar on outside click
+        document.addEventListener('click', (e) => {
+             if (miniCalendarPopup && appState.miniCalendar.pickerOpen && !miniCalendarPopup.contains(e.target) && e.target !== calendarTitle) {
+                 miniCalendarPopup.classList.remove('visible');
+                 appState.miniCalendar.pickerOpen = false;
+             }
+             // Close legend on outside click
+             if (legendPopup && legendPopup.style.display === 'block' && !legendPopup.contains(e.target) && e.target !== legendBtn) {
+                 legendPopup.style.display = 'none';
+             }
+             // Close FAB menu on outside click
+             if (fabMainBtn && fabMenu && fabContainer && fabMainBtn.classList.contains('active') && !fabContainer.contains(e.target)) {
+                  fabMainBtn.classList.remove('active');
+                  fabMenu.classList.remove('active');
+             }
+        });
+
+        // --- FAB Menu Toggle ---
+        if (fabMainBtn) fabMainBtn.addEventListener('click', (e) => { e.stopPropagation(); if(fabMenu) { fabMainBtn.classList.toggle('active'); fabMenu.classList.toggle('active'); } });
+
+        // --- View Toggle ---
+        if (viewToggleBtn) viewToggleBtn.addEventListener('click', () => { appState.currentView = (appState.currentView === 'grid' ? 'list' : 'grid'); viewToggleBtn.textContent = (appState.currentView === 'grid' ? 'نمای لیستی' : 'نمای جدولی'); renderCurrentView(); }); // Persian Text
+
+        // --- Event Modal Interactions ---
+        if (eventModal) {
+            isAllDayCheckbox.addEventListener('change', () => { const isChecked = isAllDayCheckbox.checked; startTimeInput.disabled = isChecked; endTimeInput.disabled = isChecked; if(isChecked) { /* Modal logic will handle defaults */ } });
+            cancelEventBtn?.addEventListener('click', closeEventModal);
+            eventForm?.addEventListener('submit', handleEventFormSubmit);
+            approveEventBtn?.addEventListener('click', () => handleEventStatusUpdate(STATUS.APPROVED));
+            rejectEventBtn?.addEventListener('click', () => handleEventStatusUpdate(STATUS.REJECTED));
+            deleteEventBtn?.addEventListener('click', handleEventDelete);
+        }
+
+        // --- Color Legend ---
+        if (legendBtn) legendBtn.addEventListener('click', (e) => { e.stopPropagation(); if(legendPopup) legendPopup.style.display = legendPopup.style.display === 'block' ? 'none' : 'block'; });
+
+        // --- Settings Modal ---
+        const saveSettingsBtn = document.getElementById('save-settings-btn');
+        if (saveSettingsBtn) { saveSettingsBtn.addEventListener('click', handleSettingsSave); document.getElementById('cancel-settings-btn')?.addEventListener('click', () => settingsModal.style.display = 'none'); }
+
+        // --- Departments Modal ---
+        const saveDeptsBtn = document.getElementById('save-depts-btn');
+        if (saveDeptsBtn) { saveDeptsBtn.addEventListener('click', handleDeptsSave); document.getElementById('add-new-dept-btn')?.addEventListener('click', addNewDeptEditorRow); document.getElementById('cancel-depts-btn')?.addEventListener('click', () => deptsModal.style.display = 'none'); }
+
+        // --- Users Modal ---
+        const addNewUserBtn = document.getElementById('add-new-user-btn');
+        if (addNewUserBtn) { addNewUserBtn.addEventListener('click', addNewUserEditorRow); document.getElementById('cancel-users-btn')?.addEventListener('click', () => usersModal.style.display = 'none'); }
+
+        // --- Issue Modals ---
+        const cancelIssueBtn = document.getElementById('cancel-issue-btn'); if (cancelIssueBtn) cancelIssueBtn.addEventListener('click', () => { if(issueModal) issueModal.style.display = 'none'; });
+        const sendIssueBtn = document.getElementById('send-issue-btn'); if (sendIssueBtn) sendIssueBtn.addEventListener('click', handleIssueSend);
+        const closeIssuesBtn = document.getElementById('close-issues-btn'); if (closeIssuesBtn) closeIssuesBtn.addEventListener('click', () => { if(viewIssuesModal) viewIssuesModal.style.display = 'none'; });
+
+        // --- Resize & Orientation Change ---
+        let resizeTimer;
+        window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { calculateMobileHeaderHeight(); renderGridView(); startTimeIndicator(); }, 150); });
+        window.addEventListener('orientationchange', () => { setTimeout(() => { calculateMobileHeaderHeight(); renderGridView(); startTimeIndicator(); }, 200); }); // Slight delay for orientation change
+
+        // --- Mobile Gestures ---
+        if (calendarGridContainer) {
+             calendarGridContainer.addEventListener('touchstart', handleGestureStart, { passive: false }); // Need false to preventDefault on pinch
+             calendarGridContainer.addEventListener('touchmove', handleGestureMove, { passive: false }); // Need false to preventDefault on pinch
+             calendarGridContainer.addEventListener('touchend', handleGestureEnd);
+             calendarGridContainer.addEventListener('touchcancel', handleGestureEnd);
+        }
+    }
+
+    // --- Initial Load ---
+    setupEventListeners();
+    setupFabMenu();
+    loadAndRender(); // Start the app
+});
+
+
+
+index.php
+
+<?php
+session_start();
+// Redirect to login if not authenticated
+if (!isset($_SESSION['user_id'])) {
+  header('Location: login.php');
+  exit;
+}
+
+$user_role = $_SESSION['role'] ?? 'viewer'; // Default to viewer if role isn't set
+
+// Inject user data and server time into JavaScript
+$user_data_json = json_encode([
+  'id' => $_SESSION['user_id'],
+  'username' => $_SESSION['username'],
+  'displayName' => $_SESSION['displayName'],
+  'role' => $user_role,
+  'departmentId' => $_SESSION['departmentId'],
+  'permissions' => $_SESSION['permissions'] ?? [] // Ensure permissions is an array
+]);
+
+// Get current server time in Tehran timezone (ISO 8601 format)
+date_default_timezone_set('Asia/Tehran');
+$current_server_time = date('c'); // e.g., 2025-10-27T10:45:00+03:30
+$tehran_offset = date('P'); // e.g., +03:30
+
+?>
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>داشبورد تقویم هفتگی</title>
+  <link rel="stylesheet" href="style.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Prevent zooming on mobile for better gesture control -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+</head>
+<body class="display-page">
+
+  <!-- Inject PHP data into JS -->
+  <script>
+    const CURRENT_USER = <?php echo $user_data_json; ?>;
+    const CURRENT_SERVER_TIME_ISO = "<?php echo $current_server_time; ?>";
+    const TEHRAN_TIMEZONE_OFFSET = "<?php echo $tehran_offset; ?>";
+  </script>
+
+  <!-- Loader Overlay -->
+  <div id="loader-overlay" class="hidden">
+    <div class="spinner"></div>
+  </div>
+
+  <!-- Main Page Container -->
+  <div class="page-container">
+    <header class="main-header">
+      <!-- Left Controls: Legend, View Toggle -->
+      <div class="header-controls left-controls">
+        <div id="color-legend-container">
+          <button id="color-legend-btn" class="header-btn" title="نمایش/مخفی کردن رنگ دپارتمان‌ها">
+            <!-- Icon for legend -->
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="20" height="20"><path d="M7 3a1 1 0 000 2h6a1 1 0 100-2H7zM4 7a1 1 0 011-1h10a1 1 0 110 2H5a1 1 0 01-1-1zM2 11a1 1 0 011-1h14a1 1 0 110 2H3a1 1 0 01-1-1zM1.447 15.147A1 1 0 013 15h14a1 1 0 110 2H3a1 1 0 01-.553-1.853z"/></svg>
+          </button>
+          <div id="color-legend-popup"></div>
+        </div>
+        <?php if ($user_role === 'evaluator' || $user_role === 'manager'): ?>
+          <button id="view-toggle-btn" class="small-btn secondary-btn">نمای لیستی</button>
+        <?php endif; ?>
+      </div>
+
+      <!-- Center Controls: Week Navigation -->
+      <div class="week-navigator">
+        <button id="prev-week-btn" class="week-nav-btn" title="هفته قبل">
+          <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M12.79 5.23a.75.75 0 01-.02 1.06L8.832 10l3.938 3.71a.75.75 0 11-1.04 1.08l-4.5-4.25a.75.75 0 010-1.08l4.5-4.25a.75.75 0 011.06.02z" clip-rule="evenodd" /></svg>
+        </button>
+        <!-- Title doubles as mini-calendar trigger -->
+        <h1 id="calendar-title" title="انتخاب هفته"></h1>
+        <button id="next-week-btn" class="week-nav-btn" title="هفته بعد">
+           <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd" /></svg>
+        </button>
+        <!-- New: Today Button -->
+        <button id="today-btn" class="small-btn secondary-btn" title="رفتن به هفته جاری">امروز</button>
+      </div>
+
+      <!-- Right Controls: User Info, Logout -->
+      <div class="header-controls right-controls">
+        <span class="user-display-name">کاربر: <?php echo htmlspecialchars($_SESSION['displayName'], ENT_QUOTES, 'UTF-8'); ?></span>
+        <a href="logout.php" class="logout-btn small-btn danger-btn">خروج</a>
+      </div>
+
+      <!-- New: Mini Calendar Popup (hidden by default) -->
+      <div id="mini-calendar" class="mini-calendar-popup">
+          <div class="mini-calendar-nav">
+              <button id="mini-calendar-prev">&lt;</button>
+              <span id="mini-calendar-header"></span>
+              <button id="mini-calendar-next">&gt;</button>
+          </div>
+          <div id="mini-calendar-days"></div>
+      </div>
+
+    </header>
+
+    <!-- Main Calendar Area -->
+    <div id="calendar-grid-container">
+      <!-- Grid will be rendered here by JS -->
+    </div>
+    <div id="calendar-list-container" style="display: none;">
+      <!-- List view will be rendered here by JS -->
+    </div>
+
+  </div> <!-- End page-container -->
+
+  <!-- FAB Menu Container -->
+  <div class="fab-container">
+    <!-- Main FAB Button -->
+    <button class="fab fab-main" id="fab-main-btn" title="منوی اصلی">
+      <span>+</span>
+    </button>
+    <!-- FAB Action Buttons (populated by JS) -->
+    <div class="fab-menu" id="fab-menu"></div>
+  </div>
+
+  <!-- Modals -->
+
+  <!-- Event Modal -->
+  <div id="event-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3 id="event-modal-title">رویداد جدید</h3>
+      <form id="event-form">
+        <input type="hidden" id="eventId">
+
+        <div class="form-group"> <label for="eventTitle">عنوان</label> <input type="text" id="eventTitle" required> </div>
+        <div class="form-group"> <label for="eventBy">مجری</label> <input type="text" id="eventBy"> </div>
+        <div class="form-group"> <label for="eventFor">مخاطب</label> <input type="text" id="eventFor"> </div>
+        <div class="form-group" id="event-goal-group"> <label for="eventGoal">هدف</label> <textarea id="eventGoal" rows="3"></textarea> </div>
+
+        <!-- Manager Only: Color Pickers -->
+        <div id="event-colors-manager" style="display: none;">
+          <div class="form-group color-picker"> <label>رنگ پس‌زمینه</label> <input type="color" id="eventBgColor" value="#5c6bc0"> </div>
+          <div class="form-group color-picker"> <label>رنگ متن</label> <input type="color" id="eventTextColor" value="#ffffff"> </div>
+        </div>
+
+        <!-- All Day Checkbox -->
+        <div class="form-group form-group-checkbox"> <input type="checkbox" id="isAllDay"> <label for="isAllDay">رویداد تمام-روز</label> </div>
+
+        <!-- Date/Time Inputs -->
+        <div id="time-inputs" class="time-inputs-container multi-day">
+          <div class="form-group">
+            <label for="startDay">از روز:</label>
+            <select id="startDay">
+              <option value="0">شنبه</option><option value="1">یکشنبه</option><option value="2">دوشنبه</option>
+              <option value="3">سه‌شنبه</option><option value="4">چهارشنبه</option><option value="5">پنجشنبه</option><option value="6">جمعه</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="startTime">ساعت شروع:</label>
+            <input type="time" id="startTime" class="time-input" value="09:00" required step="1800"> <!-- Step 30 mins -->
+          </div>
+          <div class="form-group">
+            <label for="endDay">تا روز:</label>
+            <select id="endDay">
+              <option value="0">شنبه</option><option value="1">یکشنبه</option><option value="2">دوشنبه</option>
+              <option value="3">سه‌شنبه</option><option value="4">چهارشنبه</option><option value="5">پنجشنبه</option><option value="6">جمعه</option>
+            </select>
+          </div>
+           <div class="form-group">
+            <label for="endTime">ساعت پایان:</label>
+            <!-- Add datalist for 24:00 suggestion -->
+            <input type="time" id="endTime" class="time-input" value="10:00" required step="1800" list="endTimeSuggestions">
+            <datalist id="endTimeSuggestions"> <option value="24:00"></option> </datalist>
+          </div>
+        </div>
+
+        <!-- Modal Actions -->
+        <div class="modal-actions" id="event-modal-actions">
+          <!-- Approval Buttons (Manager/Evaluator only) -->
+          <div id="approval-actions" style="display: none;">
+              <button type="button" id="approve-event-btn" class="secondary-btn">تایید</button>
+              <button type="button" id="reject-event-btn" class="warning-btn">رد کردن</button>
+          </div>
+          <!-- Standard Buttons -->
+          <div>
+             <button type="button" id="delete-event-btn" class="danger-btn" style="display: none;">حذف</button>
+             <button type="submit" id="save-event-btn" class="primary-btn">ذخیره</button>
+             <button type="button" id="cancel-event-btn" class="secondary-btn">انصراف</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>تنظیمات تقویم</h3>
+      <div class="form-group"> <label for="mainHeader">عنوان تقویم</label> <input type="text" id="mainHeader"> </div>
+      <div class="form-group"> <label for="weekSelector">هفته پیش‌فرض (در زمان ذخیره ثبت می‌شود)</label> <select id="weekSelector"></select> </div>
+      <div class="modal-actions">
+        <button id="save-settings-btn" class="primary-btn">ذخیره تنظیمات</button>
+        <button id="cancel-settings-btn" class="secondary-btn">انصراف</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Departments Modal -->
+  <div id="depts-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>مدیریت دپارتمان‌ها</h3>
+      <div id="depts-list-editor"></div> <hr>
+      <button id="add-new-dept-btn" class="secondary-btn small-btn" style="align-self: flex-start;">افزودن دپارتمان جدید</button>
+      <div class="modal-actions">
+         <button id="save-depts-btn" class="primary-btn">ذخیره دپارتمان‌ها</button>
+         <button id="cancel-depts-btn" class="secondary-btn">انصراف</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Users Modal -->
+  <div id="users-modal" class="modal-overlay">
+    <div class="modal-content wide"> <!-- Added 'wide' class -->
+      <h3>مدیریت کاربران</h3>
+      <div id="users-list-editor"></div> <hr>
+      <button id="add-new-user-btn" class="secondary-btn small-btn" style="align-self: flex-start;">افزودن کاربر جدید</button>
+      <div class="modal-actions">
+         <button id="cancel-users-btn" class="secondary-btn">بستن</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Issue Report Modal -->
+  <div id="issue-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>گزارش مشکل / بازخورد</h3>
+      <form id="issue-form">
+           <div class="form-group"> <label for="issue-text">لطفا مشکل یا بازخورد خود را بنویسید:</label> <textarea id="issue-text" rows="5" required></textarea> </div>
+          <div class="modal-actions">
+              <button type="button" id="send-issue-btn" class="primary-btn">ارسال پیام</button>
+              <button type="button" id="cancel-issue-btn" class="secondary-btn">انصراف</button>
+          </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- View Issues Modal -->
+  <div id="view-issues-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>مشاهده مشکلات گزارش‌شده</h3>
+      <div id="issues-list-container"></div>
+      <div class="modal-actions">
+         <button id="close-issues-btn" class="secondary-btn">بستن</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New: Toast Notification Container -->
+  <div id="toast-container"></div>
+
+  <!-- Load JavaScript -->
+  <script src="app.js"></script>
+</body>
+</html>
+
+
+
+login.php
+
+<?php
+session_start();
+// اگر کاربر از قبل لاگین بود، به داشبورد برود
+if (isset($_SESSION['user_id'])) {
+    header('Location: index.php');
+    exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $username = $_POST['username'];
+    $password = $_POST['password'];
+
+    $users = json_decode(file_get_contents('./data/users.json'), true);
+    
+    $found_user = null;
+    foreach ($users as $user) {
+        if ($user['username'] === $username) {
+            $found_user = $user;
+            break;
+        }
+    }
+
+    if ($found_user && password_verify($password, $found_user['password_hash'])) {
+        // احراز هویت موفق
+        $_SESSION['user_id'] = $found_user['id'];
+        $_SESSION['username'] = $found_user['username'];
+        $_SESSION['displayName'] = $found_user['displayName']; // <-- فیلد جدید اضافه شد
+        $_SESSION['role'] = $found_user['role'];
+        $_SESSION['departmentId'] = $found_user['departmentId'];
+        $_SESSION['permissions'] = $found_user['permissions'];
+        
+        header('Location: index.php');
+        exit;
+    } else {
+        // احراز هویت ناموفق
+        $error = 'نام کاربری یا رمز عبور اشتباه است.';
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>ورود به سیستم تقویم</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body class="login-page">
+    <div class="login-container">
+        <h1>ورود به تقویم</h1>
+        <p>برای ورود از اطلاعات زیر استفاده کنید:
+            <br><b>مدیر:</b> admin / password123
+            <br><b>کاربر:</b> proposer / password123
+        </p>
+        <?php if ($error): ?>
+            <div class="login-error"><?php echo $error; ?></div>
+        <?php endif; ?>
+        <form method="POST" action="login.php">
+            <div class="form-group">
+                <label for="username">نام کاربری:</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">رمز عبور:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit">ورود</button>
+        </form>
+    </div>
+</body>
+</html>
+
+logout.php
+
+<?php
+session_start();
+session_unset();
+session_destroy();
+header('Location: login.php');
+exit;
+?>
+
+style.css
+
+/* ==========================================================================
+   1. Global Styles & Variables
+   ========================================================================== */
+:root {
+  --color-primary: #2c3e50; /* Navy Blue */
+  --color-secondary: #198754; /* Green */
+  --color-danger: #e53935; /* Red */
+  --color-warning: #ffb300; /* Yellow */
+  --color-info: #0dcaf0; /* Cyan */
+  --color-success: #198754; /* Green (same as secondary for now) */
+  --color-border: #dce0e6; /* Light Gray */
+  --color-border-soft: #eaedf0;
+  --color-text: #2c3e50; /* Dark Text */
+  --color-text-muted: #7f8c8d; /* Muted Gray */
+  --color-surface: #ffffff; /* White */
+  --color-background: #f7f8fc; /* Very Light Gray/Blue */
+  --font-family-base: 'Pinar Regular', tahoma, sans-serif;
+  --font-family-bold: 'Pinar Bold', tahoma, sans-serif;
+  --font-family-light: 'Pinar Light', tahoma, sans-serif;
+  --font-family-black: 'Pinar Black', tahoma, sans-serif;
+  --border-radius: 8px;
+  --shadow-soft: 0 4px 12px rgba(0,0,0,0.08);
+  --shadow-medium: 0 6px 20px rgba(0,0,0,0.12);
+
+  /* Heights (calculated by JS for mobile) */
+  --header-height: 61px;
+  --mobile-header-height: 61px; /* Default, JS will update */
+  --mobile-allday-row-height: 4rem;
+  --mobile-time-axis-corner-height: 4.5rem; /* = day-label height */
+  /* Available height for timeline (calculated dynamically) */
+  --mobile-timeline-available-height: calc(100vh - var(--mobile-header-height) - var(--mobile-allday-row-height));
+}
+
+/* Font Definitions */
+@font-face { font-family: 'Pinar Black'; src: url('fonts/PINAR-BLACK.TTF') format('truetype'); font-weight: 900; }
+@font-face { font-family: 'Pinar Bold'; src: url('fonts/PINAR-BOLD.TTF') format('truetype'); font-weight: bold; }
+@font-face { font-family: 'Pinar ExtraBold'; src: url('fonts/PINAR-EXTRABOLD.TTF') format('truetype'); font-weight: 800; }
+@font-face { font-family: 'Pinar Light'; src: url('fonts/PINAR-LIGHT.TTF') format('truetype'); font-weight: 300; }
+@font-face { font-family: 'Pinar Medium'; src: url('fonts/PINAR-MEDIUM.TTF') format('truetype'); font-weight: 500; }
+@font-face { font-family: 'Pinar Regular'; src: url('fonts/PINAR-REGULAR.TTF') format('truetype'); font-weight: normal; }
+@font-face { font-family: 'Pinar SemiBold'; src: url('fonts/PINAR-SEMIBOLD.TTF') format('truetype'); font-weight: 600; }
+
+
+html, body.display-page {
+  height: 100vh;
+  overflow: hidden; /* Prevent body scroll */
+}
+
+body, input, select, button, textarea {
+  margin: 0; padding: 0; font-family: var(--font-family-base);
+  background: var(--color-background); color: var(--color-text);
+  -webkit-print-color-adjust: exact !important; color-adjust: exact !important;
+  box-sizing: border-box;
+}
+*, *::before, *::after {
+    box-sizing: inherit;
+}
+
+hr { border: none; border-top: 1px solid var(--color-border-soft); margin: 1.5rem 0; }
+button { cursor: pointer; }
+textarea { font-family: var(--font-family-base); width: 100%; padding: 0.8rem 1rem; border: 1px solid var(--color-border); border-radius: var(--border-radius); }
+
+/* ==========================================================================
+   2. Login Page Styles
+   ========================================================================== */
+body.login-page { /* Allow scroll on login page */
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; background: var(--color-primary);
+  overflow-y: auto; padding: 1rem;
+}
+.login-container { width: 100%; max-width: 400px; padding: 2.5rem; background: var(--color-surface); border-radius: var(--border-radius); box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+.login-container h1 { text-align: center; margin-top: 0; color: var(--color-primary); font-family: var(--font-family-black); }
+.login-container p { font-size: 0.9rem; background: #f1f1f1; padding: 1rem; border-radius: 8px; line-height: 1.6; }
+.login-error { background: #ffebee; color: var(--color-danger); padding: 1rem; border-radius: 8px; text-align: center; margin-bottom: 1rem; }
+.login-container form button { width: 100%; padding: 0.9rem; font-size: 1.1rem; font-family: var(--font-family-bold); color: white; background: var(--color-secondary); border: none; border-radius: var(--border-radius); margin-top: 1rem; transition: background 0.2s; }
+.login-container form button:hover { background: #146c43; }
+
+/* ==========================================================================
+   3. Form, Input, Button Styles (Global)
+   ========================================================================== */
+.form-group { margin-bottom: 1.2rem; }
+.form-group label { display: block; margin-bottom: 0.6rem; font-family: var(--font-family-bold); }
+.form-group input[type="text"], .form-group input[type="password"], .form-group input[type="color"], .form-group input[type="date"], .form-group input[type="time"], .form-group select { width: 100%; padding: 0.8rem 1rem; border: 1px solid var(--color-border); border-radius: var(--border-radius); transition: all 0.2s ease-in-out; background-color: #fdfdfd; }
+.form-group input[type="text"]:focus, .form-group input[type="password"]:focus, .form-group input[type="date"]:focus, .form-group input[type="time"]:focus, .form-group select:focus { border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(44, 62, 80, 0.15); outline: none; }
+
+/* Checkbox specific styles */
+.form-group-checkbox { display: flex; align-items: center; gap: 0.5rem; }
+.form-group-checkbox input[type="checkbox"] { width: auto; flex-shrink: 0; margin: 0; accent-color: var(--color-primary); }
+.form-group-checkbox label { margin-bottom: 0; font-family: var(--font-family-base); font-weight: normal;}
+
+.time-inputs-container { display: flex; flex-wrap: wrap; gap: 1rem; }
+.time-inputs-container.multi-day .form-group { flex: 1 1 200px; }
+.time-input { text-align: center; font-family: var(--font-family-bold); font-size: 1rem; }
+
+/* Color picker alignment */
+.color-picker { display: flex; align-items: center; gap: 0.5rem; }
+.color-picker label { margin-bottom: 0; }
+.color-picker input[type="color"] { width: 40px; height: 30px; padding: 2px; border: 1px solid var(--color-border); border-radius: 4px; }
+
+/* Buttons */
+button, .button, a.button { padding: 0.8rem 1rem; font-size: 1rem; font-family: var(--font-family-bold); color: white; border: none; border-radius: var(--border-radius); cursor: pointer; text-decoration: none; text-align: center; transition: all 0.2s ease-in-out; display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem; }
+button:disabled { cursor: not-allowed; opacity: 0.6; }
+button:hover:not(:disabled) { opacity: 0.85; }
+.primary-btn { background: var(--color-primary); }
+.danger-btn { background-color: var(--color-danger); }
+.secondary-btn { background-color: #6c757d; color: white; }
+.warning-btn { background-color: var(--color-warning); color: #333; }
+.small-btn { padding: 0.5rem 0.8rem; font-size: 0.9rem; }
+
+/* Button Spinner */
+.button-spinner { display: inline-block; width: 1em; height: 1em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: button-spin 0.6s linear infinite; }
+@keyframes button-spin { to { transform: rotate(360deg); } }
+
+/* Header Buttons (Icon-like) */
+.header-btn { background: none; border: none; padding: 0.5rem; color: var(--color-text-muted); border-radius: 50%; line-height: 1; }
+.header-btn:hover { background-color: var(--color-border-soft); color: var(--color-primary); }
+
+/* ==========================================================================
+   4. Modal (Popup) Styles
+   ========================================================================== */
+.modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; display: none; align-items: center; justify-content: center; backdrop-filter: blur(5px); animation: fadeIn 0.3s ease-out; }
+.modal-content { background: var(--color-surface); padding: 2rem; border-radius: var(--border-radius); width: 90%; max-width: 600px; display: flex; flex-direction: column; max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-medium); animation: slideInUp 0.3s ease-out; }
+.modal-content.wide { max-width: 800px; }
+.modal-content h3 { margin-top: 0; border-bottom: 2px solid var(--color-border); padding-bottom: 1rem; font-family: var(--font-family-black); }
+.modal-actions { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1.5rem; border-top: 1px solid var(--color-border-soft); padding-top: 1.5rem; justify-content: space-between; }
+.modal-actions > div { display: flex; gap: 1rem; }
+
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideInUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+/* ==========================================================================
+   5. FAB Menu Styles
+   ========================================================================== */
+.fab-container { position: fixed; bottom: 2rem; left: 2rem; z-index: 900; display: flex; align-items: flex-end; }
+.fab-main { width: 60px; height: 60px; border-radius: 50%; background: var(--color-primary); color: white; font-size: 2.5rem; border: none; box-shadow: 0 4px 12px rgba(0,0,0,0.2); cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); padding: 0; display: flex; align-items: center; justify-content: center; position: relative; z-index: 902; order: 1; }
+.fab-main span { transition: transform 0.3s; }
+.fab-main.active span { transform: rotate(45deg); }
+.fab-menu { display: flex; flex-direction: row; align-items: center; gap: 0.75rem; margin-right: 0.75rem; z-index: 901; transition: opacity 0.3s, transform 0.3s; opacity: 0; transform: translateX(-15px) scale(0.9); pointer-events: none; }
+.fab-main.active + .fab-menu { opacity: 1; transform: translateX(0) scale(1); pointer-events: auto; }
+.fab-action { width: 50px; height: 50px; border-radius: 50%; color: white; font-size: 1.5rem; display: flex; align-items: center; justify-content: center; border: none; box-shadow: 0 2px 8px rgba(0,0,0,0.15); cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); opacity: 0; transform: scale(0.7); }
+.fab-main.active + .fab-menu .fab-action, .fab-main.active ~ .fab-menu .fab-action { opacity: 1; transform: scale(1); }
+.fab-main.active + .fab-menu .fab-action:nth-child(1), .fab-main.active ~ .fab-menu .fab-action:nth-last-child(1) { transition-delay: 0.0s; }
+.fab-main.active + .fab-menu .fab-action:nth-child(2), .fab-main.active ~ .fab-menu .fab-action:nth-last-child(2) { transition-delay: 0.04s; }
+.fab-main.active + .fab-menu .fab-action:nth-child(3), .fab-main.active ~ .fab-menu .fab-action:nth-last-child(3) { transition-delay: 0.08s; }
+.fab-main.active + .fab-menu .fab-action:nth-child(4), .fab-main.active ~ .fab-menu .fab-action:nth-last-child(4) { transition-delay: 0.12s; }
+.fab-main.active + .fab-menu .fab-action:nth-child(5), .fab-main.active ~ .fab-menu .fab-action:nth-last-child(5) { transition-delay: 0.16s; }
+.fab-action.action-add { background: var(--color-secondary); }
+.fab-action.action-admin { background: var(--color-primary); }
+.fab-action.action-issue { background: var(--color-warning); color: #333; }
+.fab-action.action-view-issue { background: #6f42c1; }
+
+@media (max-width: 768px) {
+  .fab-container { flex-direction: column-reverse; align-items: flex-start; bottom: 1rem; left: 1rem; }
+  .fab-menu { flex-direction: column; margin-right: 0; margin-bottom: 0.75rem; align-items: flex-start; transform: translateY(15px) scale(0.9); }
+  .fab-main.active ~ .fab-menu { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+  .fab-main { width: 50px; height: 50px; font-size: 2rem; order: 0; }
+  .fab-action { width: 40px; height: 40px; font-size: 1.2rem; transform: scale(0.7) translateY(10px); }
+  .fab-main.active ~ .fab-menu .fab-action { transform: scale(1) translateY(0); }
+}
+
+/* ==========================================================================
+   6. Loader Overlay
+   ========================================================================== */
+#loader-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255, 255, 255, 0.7); z-index: 9999; display: flex; align-items: center; justify-content: center; transition: opacity 0.3s; }
+#loader-overlay.hidden { opacity: 0; pointer-events: none; }
+.spinner { width: 50px; height: 50px; border: 5px solid var(--color-border); border-top-color: var(--color-primary); border-radius: 50%; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ==========================================================================
+   7. Display Page - Header
+   ========================================================================== */
+.page-container { display: flex; flex-direction: column; width: 100%; height: 100vh; overflow: hidden; }
+.main-header { padding: 0.5rem 1.5rem; background-color: var(--color-surface); border-bottom: 2px solid var(--color-border); flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; position: relative; z-index: 800; height: var(--header-height); box-sizing: border-box; }
+.header-controls { display: flex; align-items: center; gap: 0.5rem; /* Reduced gap */ flex-basis: 250px; /* Adjusted basis */ }
+.header-controls.left-controls { justify-content: flex-start; }
+.header-controls.right-controls { justify-content: flex-end; }
+.logout-btn { /* Style inherited */ }
+#view-toggle-btn { /* Style inherited */ }
+.user-display-name { font-size: 0.9rem; color: var(--color-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+
+/* Week Navigator */
+.week-navigator { display: flex; align-items: center; justify-content: center; gap: 0.5rem; flex-grow: 1; position: relative; /* For mini-calendar positioning */ }
+.week-navigator h1 { margin: 0; font-family: var(--font-family-black); font-size: 1.2rem; color: var(--color-primary); text-align: center; cursor: pointer; padding: 0.5rem; border-radius: 4px; transition: background-color 0.2s; min-width: 250px; white-space: nowrap; }
+.week-navigator h1:hover { background-color: var(--color-border-soft); }
+.week-nav-btn { background: var(--color-surface); border: 1px solid var(--color-border); color: var(--color-primary); width: 36px; height: 36px; border-radius: var(--border-radius); display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); transition: all 0.2s ease-in-out; padding: 0; }
+.week-nav-btn svg { width: 20px; height: 20px; fill: currentColor; }
+.week-nav-btn:hover { background: var(--color-background); box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-color: #cdd3db; }
+.week-nav-btn:active { transform: translateY(1px); box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+#today-btn { margin-left: 0.5rem; }
+
+/* Mini Calendar Popup */
+.mini-calendar-popup { display: none; position: absolute; top: calc(100% + 5px); left: 50%; transform: translateX(-50%); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--border-radius); box-shadow: var(--shadow-medium); z-index: 900; width: 280px; padding: 0.75rem; animation: fadeIn 0.2s ease-out; }
+.mini-calendar-popup.visible { display: block; }
+.mini-calendar-nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--color-border-soft); }
+.mini-calendar-nav span { font-family: var(--font-family-bold); }
+.mini-calendar-nav button { background: none; border: none; font-size: 1.2rem; padding: 0.25rem 0.5rem; color: var(--color-primary); }
+#mini-calendar-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; text-align: center; }
+.mini-calendar-weekday { font-size: 0.8rem; color: var(--color-text-muted); font-family: var(--font-family-bold); padding-bottom: 4px; }
+.mini-calendar-day { background: none; border: none; padding: 0.5rem 0; font-size: 0.9rem; border-radius: 50%; width: 32px; height: 32px; line-height: 1; transition: background-color 0.1s; }
+.mini-calendar-day:hover { background-color: var(--color-border-soft); }
+.mini-calendar-day.today { font-family: var(--font-family-bold); border: 1px solid var(--color-primary); }
+.mini-calendar-day.selected-week { background-color: rgba(44, 62, 80, 0.1); }
+.mini-calendar-day.selected-week.today { background-color: rgba(44, 62, 80, 0.2); }
+
+
+/* ==========================================================================
+   8. Display Page - Grid
+   ========================================================================== */
+#calendar-grid-container { flex-grow: 1; overflow: hidden; position: relative; height: calc(100vh - var(--header-height)); }
+#calendar-list-container { flex-grow: 1; overflow-y: auto; padding: 1rem; }
+.calendar-grid { display: flex; flex-direction: column; height: 100%; }
+.grid-header { display: grid; grid-template-columns: 4rem 6rem 1fr; flex-shrink: 0; background-color: var(--color-surface); position: sticky; top: 0; z-index: 20; }
+.header-corner, .header-allday, .header-timeline { display: flex; align-items: center; justify-content: center; border-bottom: 2px solid var(--color-border); border-left: 2px solid var(--color-border); box-sizing: border-box; }
+.header-timeline { border-left: none; }
+.header-allday { font-family: var(--font-family-bold); }
+.header-timeline { display: grid; grid-template-columns: repeat(48, 1fr); height: 3rem; }
+.time-label { text-align: center; font-size: 0.9rem; color: var(--color-text-muted); border-right: 1px solid var(--color-border-soft); padding-top: 1rem; writing-mode: vertical-rl; transform: rotate(180deg); display: flex; align-items: end; box-sizing: border-box; }
+.time-label:nth-child(2n) { border-right: 1px solid var(--color-border); font-weight: bold; color: var(--color-text); }
+.grid-body { flex-grow: 1; overflow: auto; position: relative; }
+.day-row { display: grid; grid-template-columns: 4rem 6rem 1fr; min-height: 120px; position: relative; }
+.day-label, .all-day-cell, .timeline-cell { border-bottom: 1px solid var(--color-border); box-sizing: border-box; }
+.day-label { display: flex; flex-direction: column; align-items: center; justify-content: center; border-left: 2px solid var(--color-border); background-color: var(--color-surface); font-family: var(--font-family-bold); font-size: 1.1rem; text-align: center; position: sticky; left: 0; z-index: 5; }
+.day-label .date { font-family: var(--font-family-light); font-size: 0.8rem; color: var(--color-text-muted); }
+.all-day-cell { border-left: 2px solid var(--color-border); padding: 2px; display: grid; grid-template-rows: repeat(var(--event-count, 1), 1fr); gap: 2px; overflow: hidden; position: sticky; left: 4rem; background-color: var(--color-surface); z-index: 4; cursor: pointer; }
+.timeline-cell { position: relative; background-image: repeating-linear-gradient(to left, var(--color-border-soft) 0 1px, transparent 1px 100%), repeating-linear-gradient(to left, var(--color-border) 0 1px, transparent 1px 100%); background-size: calc(100% / 48) 100%, calc(100% / 24) 100%; min-height: 100%; cursor: pointer; }
+/* Grid time slots for click detection */
+.timeline-cell .time-slot { position: absolute; height: 100%; width: calc(100% / 48); top: 0; background: transparent; /* No visible style needed */ }
+.timeline-cell .time-slot:nth-child(odd) { right: calc(var(--slot-index) * (100% / 48)); } /* JS will set --slot-index */
+.timeline-cell .time-slot:nth-child(even) { right: calc(var(--slot-index) * (100% / 48)); }
+.is-holiday .day-label { background-color: #ffebee !important; }
+.is-holiday .all-day-cell { background-color: #ffebee !important; }
+.is-holiday .timeline-cell { background-color: #fff0f0; }
+
+/* Time Indicator */
+.time-indicator { position: absolute; background-color: var(--color-danger); z-index: 15; pointer-events: none; opacity: 0.8; }
+.time-indicator.desktop { top: 0; height: 100%; width: 2px; }
+.time-indicator.desktop::before { content: ''; position: absolute; top: -5px; right: -4px; width: 10px; height: 10px; background-color: var(--color-danger); border-radius: 50%; }
+.time-indicator.mobile { left: 0; width: 100%; height: 2px; /* Top set by JS */ } /* Now relative to parent cell */
+.time-indicator.mobile::before { content: ''; position: absolute; top: -4px; left: -5px; /* Adjusted for LTR parent */ width: 10px; height: 10px; background-color: var(--color-danger); border-radius: 50%; }
+
+/* ==========================================================================
+   9. Event Styles
+   ========================================================================== */
+.event, .event-allday { border-radius: 4px; padding: 2px 4px; font-size: 0.7rem; overflow: hidden; text-align: center; display: flex; align-items: center; justify-content: flex-start; cursor: pointer; transition: all 0.2s; position: relative; }
+.event-wrapper { position: absolute; box-sizing: border-box; padding: 2px; /* Simplified padding */ z-index: 10; }
+.event { width: 100%; height: 100%; border: 1px solid rgba(0,0,0,0.2); }
+.event-wrapper:hover .event { z-index: 11; box-shadow: var(--shadow-soft); transform: scale(1.02); filter: brightness(1.1); } /* Added hover effect */
+.event-content { flex-grow: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; padding: 0 4px; text-align: center; }
+.event[data-ismultiday="true"]:not([data-isstart="true"]) { border-top-right-radius: 0; border-bottom-right-radius: 0; border-right-width: 0; padding-right: 0; }
+.event[data-ismultiday="true"]:not([data-isend="true"]) { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 1px solid rgba(255,255,255,0.3); }
+.event-title { font-family: var(--font-family-bold); font-size: 0.7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.event-meta { opacity: 0.9; font-size: 0.6rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.event-dept.vertical { writing-mode: vertical-rl; text-orientation: mixed; transform: rotate(180deg); font-size: 0.6rem; font-family: var(--font-family-bold); background: rgba(0,0,0,0.2); padding: 4px 2px; border-radius: 3px; align-self: stretch; display: flex; align-items: center; justify-content: center; margin-left: 4px; max-height: 90%; overflow: hidden; white-space: nowrap; line-height: 1; flex-shrink: 0; }
+.event.event-ultra-condensed .event-content { padding: 0 2px; }
+.event.event-ultra-condensed .event-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.event.event-ultra-condensed .event-meta { display: none; }
+.event.event-ultra-condensed .event-dept.vertical { font-size: 0.5rem; padding: 2px 1px; margin-left: 2px; }
+.event.status-approved, .event-allday.status-approved { color: white; }
+.event.status-pending, .event-allday.status-pending { background-color: #fff9c4; color: #333; border-color: #fbc02d; background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.05) 0, rgba(0,0,0,0.05) 5px, transparent 5px, transparent 10px); }
+.event.status-rejected, .event-allday.status-rejected { background-color: #eeeeee; color: #757575; border-color: #9e9e9e; opacity: 0.8; background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.1) 0, rgba(0,0,0,0.1) 5px, transparent 5px, transparent 10px); }
+.event.status-rejected .event-title::after, .event-allday.status-rejected .event-title::after { content: "(Rejected)"; color: var(--color-danger); font-size: 0.9em; margin-right: 4px; }
+.event-locked { cursor: not-allowed !important; }
+
+/* ==========================================================================
+   10. Color Legend
+   ========================================================================== */
+#color-legend-container { position: relative; }
+#color-legend-btn { /* Style inherited from header-btn */ }
+#color-legend-popup { display: none; position: absolute; top: 100%; right: 0; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--border-radius); box-shadow: var(--shadow-soft); padding: 1rem; width: 250px; z-index: 100; margin-top: 5px; animation: fadeIn 0.2s ease-out; }
+#color-legend-popup h4 { margin: 0 0 1rem 0; padding-bottom: 0.5rem; border-bottom: 1px solid var(--color-border-soft); font-family: var(--font-family-bold); }
+#color-legend-popup ul { list-style: none; padding: 0; margin: 0; }
+#color-legend-popup li { display: flex; align-items: center; margin-bottom: 0.5rem; }
+#color-legend-popup .legend-swatch { width: 20px; height: 20px; border-radius: 4px; margin-left: 0.75rem; border: 1px solid rgba(0,0,0,0.1); }
+
+/* ==========================================================================
+   11. Manager Settings Modals Styles
+   ========================================================================== */
+#depts-list-editor .dept-item { display: grid; grid-template-columns: 1fr auto auto; /* Adjusted columns */ gap: 1rem; align-items: center; background: #f9f9f9; padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; }
+#depts-list-editor .dept-item input[type="color"] { width: 50px; } /* Fixed color input width */
+
+#users-list-editor .user-item { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); /* Responsive columns */ gap: 1rem; align-items: start; background: #f9f9f9; padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; font-size: 0.9rem; border: 1px solid var(--color-border-soft); }
+#users-list-editor .user-item-permissions { grid-column: 1 / -1; font-size: 0.9rem; padding-top: 1rem; margin-top: 1rem; border-top: 1px solid var(--color-border-soft); display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.permission-group { margin-bottom: 1rem; }
+.permission-group h5 { margin: 0 0 0.5rem 0; font-family: var(--font-family-bold); }
+.permission-group-items { display: flex; flex-direction: column; /* Stack checkboxes */ gap: 0.5rem; max-height: 120px; overflow-y: auto; background: white; padding: 0.5rem; border-radius: 6px; border: 1px solid var(--color-border); }
+.permission-group-items label { font-weight: normal; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem; }
+.permission-group-items input { width: auto; margin: 0; }
+#users-list-editor .user-item-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 0.5rem; padding-top: 1rem; margin-top: 1rem; border-top: 1px solid var(--color-border); }
+#users-list-editor .user-item-actions button { flex: 0 1 auto; width: auto; /* Allow button to size naturally */ }
+#issues-list-container .issue-item { background: #f9f9f9; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; border-right: 5px solid var(--color-warning); }
+#issues-list-container .issue-item p { margin: 0.5rem 0; font-size: 1rem; white-space: pre-wrap; /* Preserve line breaks */ }
+#issues-list-container .issue-meta { font-size: 0.8rem; color: var(--color-text-muted); margin-top: 0.5rem; }
+
+/* ==========================================================================
+   12. List View Styles
+   ========================================================================== */
+#calendar-list-container h2 { font-family: var(--font-family-black); color: var(--color-primary); border-bottom: 2px solid var(--color-border); padding-bottom: 0.5rem; margin: 0 0 1rem 0; }
+#calendar-list-container h3 { font-family: var(--font-family-bold); color: var(--color-primary); margin: 1.5rem 0 0.5rem 0; padding-bottom: 0.25rem; border-bottom: 1px solid var(--color-border-soft); }
+.list-view-item { background: var(--color-surface); border-radius: var(--border-radius); margin-bottom: 1rem; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border: 1px solid var(--color-border-soft); display: grid; grid-template-columns: 220px 1fr 1.5fr; /* Adjusted columns */ align-items: start; /* Align top */ border-right: 5px solid var(--color-border-soft); transition: border-color 0.2s; padding: 1rem; }
+.list-view-item.status-pending { border-right-color: var(--color-warning); }
+.list-view-item.status-rejected { border-right-color: #9e9e9e; opacity: 0.8; }
+.list-view-time { font-family: var(--font-family-bold); font-size: 0.9rem; line-height: 1.4; border-left: 1px solid var(--color-border-soft); padding-right: 1rem; }
+.list-view-time .list-day { font-size: 0.8rem; font-family: var(--font-family-base); color: var(--color-text-muted); margin-top: 0.25rem; }
+.list-view-details { border-left: 1px solid var(--color-border-soft); padding: 0 1rem; }
+.list-view-details h4 { margin: 0 0 0.5rem 0; font-family: var(--font-family-bold); color: var(--color-primary); font-size: 1rem; }
+.list-view-details span { font-size: 0.85rem; color: var(--color-text-muted); display: block; margin-bottom: 0.25rem; }
+.list-view-goal { padding-left: 1rem; }
+.list-view-goal h5 { margin: 0 0 0.5rem 0; font-size: 0.8rem; color: var(--color-text-muted); font-family: var(--font-family-bold); }
+.list-view-goal p { margin: 0; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap; }
+
+/* ==========================================================================
+   13. Toast Notifications (New)
+   ========================================================================== */
+#toast-container { position: fixed; bottom: 1rem; right: 1rem; z-index: 1100; display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; }
+.toast { background-color: var(--color-primary); color: white; padding: 0.75rem 1.25rem; border-radius: var(--border-radius); box-shadow: var(--shadow-medium); opacity: 0; transform: translateX(100%); transition: opacity 0.4s ease-out, transform 0.4s ease-out; font-size: 0.9rem; max-width: 300px; }
+.toast.show { opacity: 1; transform: translateX(0); }
+.toast-success { background-color: var(--color-success); }
+.toast-error { background-color: var(--color-danger); }
+.toast-warning { background-color: var(--color-warning); color: #333; }
+.toast-info { background-color: var(--color-info); color: white; }
+
+
+/* ==========================================================================
+   14. Mobile & Print
+   ========================================================================== */
+@media (max-width: 768px) {
+  /* Header adjustments */
+  .main-header { padding: 0.5rem; flex-wrap: wrap; justify-content: center; height: auto; /* Allow wrapping */ min-height: var(--header-height); /* Ensure minimum height */}
+  .week-navigator { order: -1; width: 100%; margin-bottom: 0.5rem; justify-content: center; }
+  .week-navigator h1 { font-size: 1rem; min-width: auto; flex-grow: 1; text-align: center; } /* More flexible title */
+  #today-btn { order: 1; margin-left: 0.5rem; } /* Move Today button after next */
+  .header-controls { flex-basis: auto; gap: 0.25rem; }
+  .header-controls.right-controls { flex-grow: 1; justify-content: flex-end; }
+  .user-display-name { max-width: 100px; } /* Prevent long names pushing buttons */
+  #mini-calendar { width: calc(100% - 2rem); max-width: 300px; } /* Adjust mini calendar size */
+
+  /* Grid container height based on calculated header height */
+  #calendar-grid-container { height: calc(100vh - var(--mobile-header-height)); }
+
+  /* Mobile Grid Layout */
+  .mobile-grid { display: flex; flex-direction: row; height: 100%; overflow: hidden; --mobile-day-count: 7; --mobile-hour-zoom: 2; /* Zoom levels */ --h1-height: calc(var(--mobile-timeline-available-height) / 8); --h2-height: calc(var(--mobile-timeline-available-height) / 12); --h3-height: calc(var(--mobile-timeline-available-height) / 24); --h4-height: 4rem; --timeline-h1: var(--mobile-timeline-available-height); --timeline-h2: var(--mobile-timeline-available-height); --timeline-h3: var(--mobile-timeline-available-height); --timeline-h4: calc(var(--h4-height) * 24); }
+  .mobile-time-axis { display: flex; flex-direction: column; flex-shrink: 0; width: 4rem; background-color: var(--color-surface); border-left: 1px solid var(--color-border); touch-action: pan-x; position: sticky; top: 0; left: 0; z-index: 10; height: 100%; overflow: hidden; box-sizing: border-box; }
+  .time-axis-corner { height: var(--mobile-time-axis-corner-height); border-bottom: 2px solid var(--color-border); flex-shrink: 0; position: sticky; top: 0; background: var(--color-surface); z-index: 11; box-sizing: border-box; }
+  .time-label-mobile { flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; color: var(--color-text-muted); border-bottom: 1px solid var(--color-border); transition: height 0.2s ease-out; box-sizing: border-box; }
+  .mobile-grid[style*="--mobile-hour-zoom: 1;"] .time-label-mobile:not(.all-day-header) { height: var(--h1-height); }
+  .mobile-grid[style*="--mobile-hour-zoom: 2;"] .time-label-mobile:not(.all-day-header) { height: var(--h2-height); }
+  .mobile-grid[style*="--mobile-hour-zoom: 3;"] .time-label-mobile:not(.all-day-header) { height: var(--h3-height); }
+  .mobile-grid[style*="--mobile-hour-zoom: 4;"] .time-label-mobile:not(.all-day-header) { height: var(--h4-height); }
+  .time-label-mobile.all-day-header { height: var(--mobile-allday-row-height); font-family: var(--font-family-bold); color: var(--color-text); border-bottom: 2px solid var(--color-border); flex-shrink: 0; position: sticky; top: var(--mobile-time-axis-corner-height); background: var(--color-surface); z-index: 11; box-sizing: border-box; }
+  .mobile-days-container { display: flex; flex-direction: row; flex-grow: 1; overflow: auto; scroll-snap-type: x mandatory; position: relative; height: 100%; overscroll-behavior-x: contain; box-sizing: border-box; }
+  .day-column { display: flex; flex-direction: column; width: calc((100vw - 4rem) / var(--mobile-day-count)); /* Adjusted width calculation */ min-width: calc((100vw - 4rem) / 7); flex-shrink: 0; scroll-snap-align: start; border-right: 2px solid var(--color-border); position: relative; height: auto; transition: width 0.2s ease-out; box-sizing: border-box; }
+  .day-column:last-child { border-right: none; } /* Remove border on last column */
+  .day-column .day-label { border-left: none; border-bottom: 2px solid var(--color-border); padding: 0.5rem; height: var(--mobile-time-axis-corner-height); flex-shrink: 0; position: sticky; top: 0; background-color: var(--color-surface); z-index: 5; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .day-column .all-day-cell { min-height: var(--mobile-allday-row-height); border-left: none; border-bottom: 2px solid var(--color-border); flex-shrink: 0; position: sticky; top: var(--mobile-time-axis-corner-height); background-color: var(--color-surface); z-index: 5; box-sizing: border-box; padding: 2px; display: grid; grid-template-rows: repeat(var(--event-count, 1), 1fr); gap: 2px; overflow: hidden; cursor: pointer; }
+  .day-column.is-holiday .day-label, .day-column.is-holiday .all-day-cell { background-color: #ffebee !important; }
+  .day-column .timeline-cell { border-left: none; flex-grow: 1; background-image: repeating-linear-gradient(to bottom, var(--color-border-soft) 0 1px, transparent 1px 100%), repeating-linear-gradient(to bottom, var(--color-border) 0 1px, transparent 1px 100%); position: relative; transition: min-height 0.2s ease-out; box-sizing: border-box; cursor: pointer; min-height: var(--timeline-h1); /* Default */ }
+  .mobile-grid[style*="--mobile-hour-zoom: 1;"] .timeline-cell { background-size: 100% calc(100% / 8), 100% calc(100% / 8); min-height: var(--timeline-h1); }
+  .mobile-grid[style*="--mobile-hour-zoom: 2;"] .timeline-cell { background-size: 100% calc(100% / 12), 100% calc(100% / 12); min-height: var(--timeline-h2); }
+  .mobile-grid[style*="--mobile-hour-zoom: 3;"] .timeline-cell { background-size: 100% calc(100% / 48), 100% calc(100% / 24); min-height: var(--timeline-h3); }
+  .mobile-grid[style*="--mobile-hour-zoom: 4;"] .timeline-cell { background-size: 100% calc(100% / 48), 100% calc(100% / 24); min-height: var(--timeline-h4); }
+  .day-column .event-wrapper { padding: 1px; /* Reduced padding */ box-sizing: border-box; }
+  .day-column .event, .day-column .event-allday { padding: 1px 2px; justify-content: center; align-items: center; box-sizing: border-box; }
+  .event-dept.vertical { font-size: 0.5rem; padding: 2px 1px; margin-left: 2px;}
+
+  /* Mobile List View */
+  .list-view-item { grid-template-columns: 1fr; } /* Stack columns */
+  .list-view-time, .list-view-details { border-left: none; border-bottom: 1px solid var(--color-border-soft); padding: 0.75rem; padding-right: 0.75rem; /* Adjust padding */}
+  .list-view-goal { padding: 0.75rem; }
+  .list-view-time { text-align: right; }
+
+}
+
+/* Print Styles */
+@media print {
+  body { overflow: visible !important; height: auto !important; font-size: 8pt; background: #fff; }
+  .page-container { height: auto; border: 3px double #333; padding: 0.5cm; box-sizing: border-box; overflow: visible !important; }
+  .main-header { padding: 0 0 0.5cm 0; text-align: center; box-shadow: none; border-bottom: 2px solid #333; margin-bottom: 0.5cm; position: static !important; height: auto !important; }
+  .main-header h1 { font-size: 1.5rem; }
+  #calendar-grid-container { height: auto !important; overflow: visible !important; }
+  .calendar-grid, .mobile-grid { border: 1px solid #666; height: auto !important; }
+  .grid-body, .mobile-days-container { overflow: visible !important; height: auto !important; }
+  .day-row { height: auto !important; min-height: unset !important; page-break-inside: avoid; }
+  .day-column .timeline-cell { min-height: unset !important; }
+  .day-label, .all-day-cell, .mobile-time-axis, .time-axis-corner, .grid-header { position: static !important; }
+  .event, .event-allday { box-shadow: none; border: 1px solid #777; }
+  .fab-container, .modal-overlay, #loader-overlay, .header-controls, .week-nav-btn, #today-btn, #mini-calendar, #toast-container { display: none !important; }
+  #calendar-list-container { display: none; }
+  .time-indicator { display: none; }
+}
+
+
+data/.htaccess
+
+Deny from all
+
+data/data.json
+
+{
+    "settings": {
+        "headerText": "تقویم اجرایی",
+        "weekStartDate": "2025-10-25"
+    },
+    "holidays": [
+        {
+            "day": 6,
+            "occasion": "جمعه"
+        }
+    ],
+    "departments": [
+        {
+            "id": "d1",
+            "name": "مدرسه دوره اول",
+            "color": "#fd7e14"
+        },
+        {
+            "id": "d2",
+            "name": "دپارتمان فنی",
+            "color": "#0d6efd"
+        },
+        {
+            "id": "d3",
+            "name": "دپارتمان بازرگانی",
+            "color": "#198754"
+        }
+    ],
+    "events": [
+        {
+            "id": 1729328400000,
+            "title": "جلسه بازبینی تولید",
+            "by": "تیم تولید",
+            "for": "همه",
+            "color": "#fd7e14",
+            "textColor": "#ffffff",
+            "isAllDay": false,
+            "proposerId": "u_proposer_1",
+            "departmentId": "d1",
+            "status": "approved",
+            "goal": "بررسی پیشرفت پروژه X و مشکلات خط تولید.",
+            "startDateTime": "2025-10-11T12:00:00+03:30",
+            "endDateTime": "2025-10-11T15:00:00+03:30"
+        },
+        {
+            "id": "1729328400001",
+            "title": "رویداد چند روزه فنی",
+            "by": "تیم فنی",
+            "for": "مدیران",
+            "color": "#0d6efd",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "proposerId": "u_evaluator_1",
+            "departmentId": "d2",
+            "status": "approved",
+            "goal": "اعمال پچ‌های امنیتی و مانیتورینگ سرورها طی ۳ روز.",
+            "startDateTime": "2025-10-12T00:00:00",
+            "endDateTime": "2025-10-13T00:00:00"
+        },
+        {
+            "id": 1729328400002,
+            "title": "رویداد تمام روز (تعطیلات)",
+            "by": "منابع انسانی",
+            "for": "همه",
+            "color": "#198754",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "proposerId": "u_manager_1",
+            "departmentId": "d3",
+            "status": "approved",
+            "goal": "رویداد داخلی شرکت.",
+            "startDateTime": "2025-10-15T00:00:00",
+            "endDateTime": "2025-10-15T24:00:00"
+        },
+        {
+            "id": "1761326930668",
+            "title": "برنامه ۱",
+            "by": "امیر محمد",
+            "for": "مخاطبان",
+            "goal": "برنامه ۲",
+            "isAllDay": false,
+            "startDateTime": "2025-10-20T10:00:00+03:30",
+            "endDateTime": "2025-10-20T12:00:00+03:30",
+            "proposerId": "u_proposer_1",
+            "departmentId": "d1",
+            "status": "approved",
+            "color": "#fd7e14",
+            "textColor": "#ffffff"
+        },
+        {
+            "title": "رویداد تمام روز ۱",
+            "by": "برنامه",
+            "for": "مجری",
+            "goal": "هدف",
+            "isAllDay": false,
+            "startDateTime": "2025-10-25T04:30:00+03:30",
+            "endDateTime": "2025-10-25T06:30:00+03:30",
+            "id": "1761552498_505",
+            "proposerId": "u_manager_1",
+            "departmentId": null,
+            "status": "approved",
+            "color": "#5c6bc0",
+            "textColor": "#ffffff"
+        }
+    ]
+}
+
+data/issues.json
+
+{
+    "0": {
+        "id": 1761224509,
+        "userId": "u_manager_1",
+        "userName": "مدیر سیستم",
+        "text": "پیام ۱\nمشکل سیستم چیه؟",
+        "timestamp": "2025-10-23T15:01:49+02:00",
+        "status": "new"
+    },
+    "events": [],
+    "departments": [],
+    "holidays": [],
+    "1": {
+        "id": 1761557704,
+        "userId": "u_manager_1",
+        "userName": "مدیر سیستم",
+        "text": "سلام",
+        "timestamp": "2025-10-27T13:05:04+03:30",
+        "status": "new"
+    }
+}
+
+data/users.json
+
+[
+    {
+        "id": "u_manager_1",
+        "username": "admin",
+        "displayName": "مدیر سیستم",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "manager",
+        "departmentId": null,
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": true,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_proposer_1",
+        "username": "amir",
+        "displayName": "امیر محمد",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "proposer",
+        "departmentId": "d1",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d1"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_evaluator_1",
+        "username": "evaluator",
+        "displayName": "ارزیاب فنی",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "evaluator",
+        "departmentId": "d2",
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_viewer_1",
+        "username": "viewer",
+        "displayName": "بیننده (بازرگانی)",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "viewer",
+        "departmentId": "d3",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d3"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    }
+]
+

@@ -1,0 +1,62 @@
+[
+    {
+        "id": "u_manager_1",
+        "username": "admin",
+        "displayName": "مدیر سیستم",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "manager",
+        "departmentId": null,
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": true,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_proposer_1",
+        "username": "amir",
+        "displayName": "امیر محمد",
+        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "role": "proposer",
+        "departmentId": "d1",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d1"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_evaluator_1",
+        "username": "evaluator",
+        "displayName": "ارزیاب فنی",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "evaluator",
+        "departmentId": "d2",
+        "permissions": {
+            "view_all_depts": true,
+            "view_depts": [],
+            "view_all_users": false,
+            "view_users": []
+        }
+    },
+    {
+        "id": "u_viewer_1",
+        "username": "viewer",
+        "displayName": "بیننده (بازرگانی)",
+        "password_hash": "$2y$10$T8G1P.fAVr9P\/r.lE6S1h.DkXvRAcXRmqi1B2.phdDZlq.6.sJmC6",
+        "role": "viewer",
+        "departmentId": "d3",
+        "permissions": {
+            "view_all_depts": false,
+            "view_depts": [
+                "d3"
+            ],
+            "view_all_users": false,
+            "view_users": []
+        }
+    }
+]

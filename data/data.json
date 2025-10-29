@@ -1,0 +1,121 @@
+{
+    "settings": {
+        "headerText": "تقویم اجرایی",
+        "weekStartDate": "2025-10-25"
+    },
+    "holidays": [
+        {
+            "day": 6,
+            "occasion": "جمعه"
+        }
+    ],
+    "departments": [
+        {
+            "id": "d1",
+            "name": "مدرسه دوره اول",
+            "color": "#fd7e14"
+        },
+        {
+            "id": "d2",
+            "name": "دپارتمان فنی",
+            "color": "#0d6efd"
+        },
+        {
+            "id": "d3",
+            "name": "دپارتمان بازرگانی",
+            "color": "#198754"
+        }
+    ],
+    "events": [
+        {
+            "id": 1729328400000,
+            "title": "جلسه بازبینی تولید",
+            "by": "تیم تولید",
+            "for": "همه",
+            "color": "#fd7e14",
+            "textColor": "#ffffff",
+            "isAllDay": false,
+            "proposerId": "u_proposer_1",
+            "departmentId": "d1",
+            "status": "approved",
+            "goal": "بررسی پیشرفت پروژه X و مشکلات خط تولید.",
+            "startDateTime": "2025-10-11T12:00:00+03:30",
+            "endDateTime": "2025-10-11T15:00:00+03:30"
+        },
+        {
+            "id": "1729328400001",
+            "title": "رویداد چند روزه فنی",
+            "by": "تیم فنی",
+            "for": "مدیران",
+            "color": "#0d6efd",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "proposerId": "u_evaluator_1",
+            "departmentId": "d2",
+            "status": "approved",
+            "goal": "اعمال پچ‌های امنیتی و مانیتورینگ سرورها طی ۳ روز.",
+            "startDateTime": "2025-10-12T00:00:00",
+            "endDateTime": "2025-10-13T00:00:00"
+        },
+        {
+            "id": 1729328400002,
+            "title": "رویداد تمام روز (تعطیلات)",
+            "by": "منابع انسانی",
+            "for": "همه",
+            "color": "#198754",
+            "textColor": "#ffffff",
+            "isAllDay": true,
+            "proposerId": "u_manager_1",
+            "departmentId": "d3",
+            "status": "approved",
+            "goal": "رویداد داخلی شرکت.",
+            "startDateTime": "2025-10-15T00:00:00",
+            "endDateTime": "2025-10-15T24:00:00"
+        },
+        {
+            "id": "1761326930668",
+            "title": "برنامه ۱",
+            "by": "امیر محمد",
+            "for": "مخاطبان",
+            "goal": "برنامه ۲",
+            "isAllDay": false,
+            "startDateTime": "2025-10-19T23:30:00+03:30",
+            "endDateTime": "2025-10-20T01:30:00+03:30",
+            "proposerId": "u_proposer_1",
+            "departmentId": "",
+            "status": "approved",
+            "color": "#5c6bc0",
+            "textColor": "#ffffff"
+        },
+        {
+            "id": "evt_69003835626668.64731418",
+            "proposerId": "u_manager_1",
+            "departmentId": null,
+            "title": "برنامه ۱",
+            "by": "امیر محمد",
+            "for": "محمدی",
+            "goal": "برنام ۱۱۱۱",
+            "isAllDay": false,
+            "startDateTime": "2025-10-24T21:15:00+03:30",
+            "endDateTime": "2025-10-24T22:15:00+03:30",
+            "status": "approved",
+            "color": "#5c6bc0",
+            "textColor": "#ffffff"
+        },
+        {
+            "title": "رویداد تمام روز ۱",
+            "by": "برنامه",
+            "for": "مجری",
+            "goal": "هدف",
+            "isAllDay": false,
+            "startDateTime": "2025-10-25T08:00:00+03:30",
+            "endDateTime": "2025-10-25T11:00:00+03:30",
+            "id": "1761552498_505",
+            "proposerId": "u_manager_1",
+            "departmentId": "",
+            "status": "approved",
+            "color": "#5c6bc0",
+            "textColor": "#ffffff"
+        }
+    ]
+}

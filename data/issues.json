@@ -1,0 +1,21 @@
+{
+    "0": {
+        "id": 1761224509,
+        "userId": "u_manager_1",
+        "userName": "مدیر سیستم",
+        "text": "پیام ۱\nمشکل سیستم چیه؟",
+        "timestamp": "2025-10-23T15:01:49+02:00",
+        "status": "new"
+    },
+    "events": [],
+    "departments": [],
+    "holidays": [],
+    "1": {
+        "id": 1761557704,
+        "userId": "u_manager_1",
+        "userName": "مدیر سیستم",
+        "text": "سلام",
+        "timestamp": "2025-10-27T13:05:04+03:30",
+        "status": "new"
+    }
+}
