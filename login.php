@@ -1,4 +1,6 @@
 <?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 session_start();
 // اگر کاربر از قبل لاگین بود، به داشبورد برود
 if (isset($_SESSION['user_id'])) {
@@ -30,6 +32,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $_SESSION['departmentId'] = $found_user['departmentId'];
         $_SESSION['permissions'] = $found_user['permissions'];
         
+        // Debugging: Check if session is being set
+        error_log("Session created for user: " . $found_user['username']);
+
         header('Location: index.php');
         exit;
     } else {

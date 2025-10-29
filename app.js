@@ -1271,12 +1271,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 if (!isNaN(startDT)) {
                     elements.startDateInput.value = formatDate(startDT); // YYYY-MM-DD
-                    elements.startTimeInput.value = `${String(startDT.getHours()).padStart(2,'0')}:${String(startDT.getMinutes()).padStart(2,'0')}`; //
+                    document.getElementById('startHour').value = startDT.getHours().toString().padStart(2, '0');
+                    document.getElementById('startMinute').value = startDT.getMinutes().toString().padStart(2, '0');
                 } else throw new Error("Invalid start date"); //
 
                 if (!isNaN(endDT)) {
                     elements.endDateInput.value = formatDate(endDT); // YYYY-MM-DD (adjusted if 24:00)
-                    elements.endTimeInput.value = isEndTime24 ? '24:00' : `${String(new Date(event.endDateTime).getHours()).padStart(2,'0')}:${String(new Date(event.endDateTime).getMinutes()).padStart(2,'0')}`; // Use original for time if not 24:00
+                    if (isEndTime24) {
+                        document.getElementById('endHour').value = '24';
+                        document.getElementById('endMinute').value = '00';
+                    } else {
+                        document.getElementById('endHour').value = endDT.getHours().toString().padStart(2, '0');
+                        document.getElementById('endMinute').value = endDT.getMinutes().toString().padStart(2, '0');
+                    }
                 } else throw new Error("Invalid end date"); //
                 // Colors for manager
                 if (CURRENT_USER.role === ROLES.MANAGER) {
@@ -1332,11 +1339,16 @@ document.addEventListener('DOMContentLoaded', () => {
                  prefillStartDate.setDate(prefillStartDate.getDate() + prefillDateInfo.dayIndex); // 
             }
             elements.startDateInput.value = formatDate(prefillStartDate); // 
-            elements.startTimeInput.value = prefillDateInfo?.time || '09:00'; // Use prefill time if available 
+            const prefillTime = prefillDateInfo?.time || '09:00';
+            const [prefillHour, prefillMinute] = prefillTime.split(':');
+            document.getElementById('startHour').value = prefillHour;
+            document.getElementById('startMinute').value = prefillMinute;
+
             // Default end time (e.g., 1 hour later)
-            let endHour = parseInt((prefillDateInfo?.time || '09:00').split(':')[0]) + 1; // 
+            let endHour = parseInt(prefillHour) + 1; //
             elements.endDateInput.value = formatDate(prefillStartDate); // Default end date same as start 
-            elements.endTimeInput.value = `${String(endHour % 24).padStart(2, '0')}:${(prefillDateInfo?.time || '09:00').split(':')[1] || '00'}`; // Handle hour wrap around
+            document.getElementById('endHour').value = endHour.toString().padStart(2, '0');
+            document.getElementById('endMinute').value = prefillMinute;
 
             // Role specific UI
             if (CURRENT_USER.role === ROLES.MANAGER) {
@@ -1377,9 +1389,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // --- Read values ---
         const startDateValue = elements.startDateInput.value; // YYYY-MM-DD
-        const startTimeValue = elements.startTimeInput.value; // HH:MM (24hr)
+        const startHour = document.getElementById('startHour').value;
+        const startMinute = document.getElementById('startMinute').value;
+        const startTimeValue = `${startHour}:${startMinute}`;
         const endDateValue = elements.endDateInput.value;   // YYYY-MM-DD
-        const endTimeValue = elements.endTimeInput.value;     // HH:MM (24hr) or "24:00"
+        const endHour = document.getElementById('endHour').value;
+        const endMinute = document.getElementById('endMinute').value;
+        const endTimeValue = `${endHour}:${endMinute}`;
 
         // --- Basic Frontend Validation ---
         if (!elements.eventTitleInput.value.trim()) {
@@ -1388,11 +1404,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (!startDateValue || !endDateValue) {
             showToast('تاریخ شروع و پایان الزامی است.', true); // 
-            elements.saveEventBtn.disabled = false; elements.saveEventBtn.textContent = 'ذخیره'; return; // 
-        }
-        // Time validation (native input usually handles format)
-        if (!elements.isAllDayCheckbox.checked && (!startTimeValue || !endTimeValue)) {
-            showToast('ساعت شروع و پایان الزامی است.', true); // 
             elements.saveEventBtn.disabled = false; elements.saveEventBtn.textContent = 'ذخیره'; return; // 
         }
 
@@ -2535,19 +2546,25 @@ document.addEventListener('DOMContentLoaded', () => {
         if (elements.eventModal) {
             elements.isAllDayCheckbox?.addEventListener('change', (e) => {
                 const isChecked = e.target.checked; // 
-                elements.startTimeInput.disabled = isChecked; // 
-                elements.endTimeInput.disabled = isChecked; // 
+                document.getElementById('startHour').disabled = isChecked;
+                document.getElementById('startMinute').disabled = isChecked;
+                document.getElementById('endHour').disabled = isChecked;
+                document.getElementById('endMinute').disabled = isChecked;
                 // Keep date inputs enabled
                 if(isChecked) {
                     // Set default all-day times
-                    elements.startTimeInput.value = "00:00"; // 
-                    elements.endTimeInput.value = "24:00"; // 
+                    document.getElementById('startHour').value = "00";
+                    document.getElementById('startMinute').value = "00";
+                    document.getElementById('endHour').value = "24";
+                    document.getElementById('endMinute').value = "00";
                     // If start/end days were different, reset end day to start day
                     elements.endDateInput.value = elements.startDateInput.value; // 
                 } else {
                     // Restore default times
-                     if (elements.startTimeInput.value === "00:00") elements.startTimeInput.value = "09:00"; // 
-                     if (elements.endTimeInput.value === "24:00") elements.endTimeInput.value = "10:00"; // 
+                    document.getElementById('startHour').value = "09";
+                    document.getElementById('startMinute').value = "00";
+                    document.getElementById('endHour').value = "10";
+                    document.getElementById('endMinute').value = "00";
                 }
             });
             elements.cancelEventBtn?.addEventListener('click', closeEventModal); // 
@@ -2611,11 +2628,77 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function populateTimePickers() {
+        const startHour = document.getElementById('startHour');
+        const startMinute = document.getElementById('startMinute');
+        const endHour = document.getElementById('endHour');
+        const endMinute = document.getElementById('endMinute');
+
+        if (!startHour) return; // Guard clause
+
+        for (let i = 0; i < 24; i++) {
+            const hour = i.toString().padStart(2, '0');
+            startHour.innerHTML += `<option value="${hour}">${hour}</option>`;
+            endHour.innerHTML += `<option value="${hour}">${hour}</option>`;
+        }
+        endHour.innerHTML += `<option value="24">24</option>`;
+
+
+        for (let i = 0; i < 60; i += 15) {
+            const minute = i.toString().padStart(2, '0');
+            startMinute.innerHTML += `<option value="${minute}">${minute}</option>`;
+            endMinute.innerHTML += `<option value="${minute}">${minute}</option>`;
+        }
+    }
+
+
+    function setupDatePickers() {
+        const startDateInput = document.getElementById('startDate');
+        const endDateInput = document.getElementById('endDate');
+
+        if (!startDateInput) return; // Guard clause
+
+        const startDatePicker = new Pikaday({
+            field: startDateInput,
+            trigger: document.getElementById('start-day-picker-btn'),
+            i18n: {
+                previousMonth: 'ماه قبل',
+                nextMonth: 'ماه بعد',
+                months: ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور', 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند'],
+                weekdays: ['یک‌شنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنج‌شنبه', 'جمعه', 'شنبه'],
+                weekdaysShort: ['ی', 'د', 'س', 'چ', 'پ', 'ج', 'ش']
+            },
+            isRTL: true,
+            firstDay: 6, // Saturday
+            format: 'YYYY-MM-DD',
+            onSelect: () => {
+                endDateInput.value = startDateInput.value;
+            }
+        });
+
+        const endDatePicker = new Pikaday({
+            field: endDateInput,
+            trigger: document.getElementById('end-day-picker-btn'),
+            i18n: {
+                previousMonth: 'ماه قبل',
+                nextMonth: 'ماه بعد',
+                months: ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور', 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند'],
+                weekdays: ['یک‌شنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنج‌شنبه', 'جمعه', 'شنبه'],
+                weekdaysShort: ['ی', 'د', 'س', 'چ', 'پ', 'ج', 'ش']
+            },
+            isRTL: true,
+            firstDay: 6, // Saturday
+            format: 'YYYY-MM-DD'
+        });
+    }
+
     // ===================================================================
     // 14. Initial Load
     // ===================================================================
     function initializeApp() {
         console.log("Initializing Calendar App V.1.5.8"); // 
+        populateTimePickers();
+        setupDatePickers();
         setupEventListeners(); // 
         setupFabMenu(); // 
         loadAndRender(); // Start the app 
