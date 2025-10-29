@@ -3,7 +3,7 @@
         "id": "u_manager_1",
         "username": "admin",
         "displayName": "مدیر سیستم",
-        "password_hash": "$2y$10$7un8JiA6N.ZdFXqX.g8M7uCQEWgEhgGxBbFls9o2R7HFEwTfdRlmi",
+        "password_hash": "$2y$10$mMr.zEBFvJJIGGjLozEVJO2HUWMUnbbqFlqs4ngD0j.YrWkWVAiFe",
         "role": "manager",
         "departmentId": null,
         "permissions": {

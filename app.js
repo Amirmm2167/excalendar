@@ -84,9 +84,10 @@ document.addEventListener('DOMContentLoaded', () => {
         startDateInput: document.getElementById('startDate'), // Changed ID from V1.5.6
         startTimeInput: document.getElementById('startTime'), // 
         endDateInput: document.getElementById('endDate'),   // Changed ID
-        endTimeInput: document.getElementById('endTime'),   // 
-        startDayPickerBtn: document.getElementById('start-day-picker-btn'), // 
-        endDayPickerBtn: document.getElementById('end-day-picker-btn'),     // 
+        startHour: document.getElementById('startHour'),
+        startMinute: document.getElementById('startMinute'),
+        endHour: document.getElementById('endHour'),
+        endMinute: document.getElementById('endMinute'),
         approvalActions: document.getElementById('approval-actions'), // 
         approveEventBtn: document.getElementById('approve-event-btn'), // 
         rejectEventBtn: document.getElementById('reject-event-btn'), // 
@@ -1267,7 +1268,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (event.startDateTime && event.startDateTime.includes('T')) {
                     const [startDate, startTime] = event.startDateTime.split('T');
                     elements.startDateInput.value = startDate;
-                    elements.startTimeInput.value = startTime.substring(0, 5); // HH:MM
+                    const [startHour, startMinute] = startTime.substring(0, 5).split(':');
+                    elements.startHour.value = startHour;
+                    elements.startMinute.value = startMinute;
                 } else { throw new Error("Invalid startDateTime format"); }
 
                 if (event.endDateTime && event.endDateTime.includes('T')) {
@@ -1275,9 +1278,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     elements.endDateInput.value = endDate;
                     // Handle the special "24:00:00" case
                     if (endTime.startsWith('24:00')) {
-                        elements.endTimeInput.value = '24:00';
+                        elements.endHour.value = '00';
+                        elements.endMinute.value = '00';
                     } else {
-                        elements.endTimeInput.value = endTime.substring(0, 5); // HH:MM
+                        const [endHour, endMinute] = endTime.substring(0, 5).split(':');
+                        elements.endHour.value = endHour;
+                        elements.endMinute.value = endMinute;
                     }
                 } else { throw new Error("Invalid endDateTime format"); }
 
@@ -1360,6 +1366,51 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         elements.isAllDayCheckbox.dispatchEvent(new Event('change')); // 
+
+        // Initialize Jalali Date Pickers
+        const startDatePicker = new Pikaday({
+            field: elements.startDateInput,
+            i18n: {
+                previousMonth: 'ماه قبل',
+                nextMonth: 'ماه بعد',
+                months: ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور', 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند'],
+                weekdays: ['یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه', 'شنبه'],
+                weekdaysShort: ['ی', 'د', 'س', 'چ', 'پ', 'ج', 'ش']
+            },
+            firstDay: 6, // Saturday
+            isRTL: true,
+            format: 'YYYY-MM-DD',
+            onSelect: () => {
+                endDatePicker.setMinDate(startDatePicker.getDate());
+            }
+        });
+
+        const endDatePicker = new Pikaday({
+            field: elements.endDateInput,
+            i18n: {
+                previousMonth: 'ماه قبل',
+                nextMonth: 'ماه بعد',
+                months: ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور', 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند'],
+                weekdays: ['یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه', 'شنبه'],
+                weekdaysShort: ['ی', 'د', 'س', 'چ', 'پ', 'ج', 'ش']
+            },
+            firstDay: 6, // Saturday
+            isRTL: true,
+            format: 'YYYY-MM-DD',
+            onSelect: () => {
+                startDatePicker.setMaxDate(endDatePicker.getDate());
+            }
+        });
+
+        if (event) {
+            startDatePicker.setDate(elements.startDateInput.value);
+            endDatePicker.setDate(elements.endDateInput.value);
+        } else {
+            const today = new Date();
+            startDatePicker.setDate(today);
+            endDatePicker.setDate(today);
+        }
+
         elements.eventModal.classList.add('active'); // 
     }
 
@@ -1380,9 +1431,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // --- Read values ---
         const startDateValue = elements.startDateInput.value; // YYYY-MM-DD
-        const startTimeValue = elements.startTimeInput.value; // HH:MM (24hr)
+        const startTimeValue = `${elements.startHour.value}:${elements.startMinute.value}`; // HH:MM (24hr)
         const endDateValue = elements.endDateInput.value;   // YYYY-MM-DD
-        const endTimeValue = elements.endTimeInput.value;     // HH:MM (24hr) or "24:00"
+        const endTimeValue = `${elements.endHour.value}:${elements.endMinute.value}`;     // HH:MM (24hr) or "24:00"
 
         // --- Basic Frontend Validation ---
         if (!elements.eventTitleInput.value.trim()) {
@@ -1571,7 +1622,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // Add actual days
         const today = estimateCurrentServerTime(); // Use estimated server time for 'today' marker
         const todayDateStr = formatDate(today); // 
-        const selectedDateStr = appState.miniCalendar.selectedDate ? formatDate(appState.miniCalendar.selectedDate) : ''; // 
+        const selectedDateStr = appState.miniCal.selectedDate ? formatDate(appState.miniCal.selectedDate) : ''; //
 
         // Highlight current week
         const weekStartMS = appState.currentWeekStartDate.getTime();
@@ -1601,15 +1652,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function changeMiniCalendarMonth(delta) {
-        appState.miniCalendar.currentMonthDate.setMonth(appState.miniCalendar.currentMonthDate.getMonth() + delta); // 
+        appState.miniCal.currentMonthDate.setMonth(appState.miniCal.currentMonthDate.getMonth() + delta); //
         renderMiniCalendar(); // 
     }
 
     function handleMiniCalendarDayClick(selectedFullDate) {
-        appState.miniCalendar.selectedDate = selectedFullDate; // Store the selected Date object
+        appState.miniCal.selectedDate = selectedFullDate; // Store the selected Date object
         closeMiniCalendar(); // 
         // Logic based on which input opened the calendar (if any)
-        const targetInputId = appState.miniCalendar.targetInputId; // 
+        const targetInputId = appState.miniCal.targetInputId; //
         const selectedDateStr = formatDate(selectedFullDate); // 
 
         if (targetInputId === 'startDate' || targetInputId === 'endDate') {
@@ -2609,8 +2660,22 @@ document.addEventListener('DOMContentLoaded', () => {
     // ===================================================================
     // 14. Initial Load
     // ===================================================================
+    function populateTimePickers() {
+        for (let i = 0; i < 24; i++) {
+            const hour = String(i).padStart(2, '0');
+            elements.startHour.innerHTML += `<option value="${hour}">${hour}</option>`;
+            elements.endHour.innerHTML += `<option value="${hour}">${hour}</option>`;
+        }
+        for (let i = 0; i < 60; i += 15) {
+            const minute = String(i).padStart(2, '0');
+            elements.startMinute.innerHTML += `<option value="${minute}">${minute}</option>`;
+            elements.endMinute.innerHTML += `<option value="${minute}">${minute}</option>`;
+        }
+    }
+
     function initializeApp() {
         console.log("Initializing Calendar App V.1.5.8"); // 
+        populateTimePickers();
         setupEventListeners(); // 
         setupFabMenu(); // 
         loadAndRender(); // Start the app 
